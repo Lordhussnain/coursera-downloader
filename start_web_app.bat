@@ -11,31 +11,44 @@ if /I "%~1"=="--elevated" (
 )
 
 rem ---------------------------------------------------------------------------
-rem Pick the first interpreter that already has the requirements installed:
-rem   1. .venv\Scripts\python.exe          (README instructions)
-rem   2. %CONDA_PREFIX%\python.exe         (activated conda environment)
+rem Pick the interpreter to run the app with:
+rem   1. %CONDA_PREFIX%\python.exe         (an activated conda/Anaconda env)
+rem   2. .venv\Scripts\python.exe          (README instructions)
 rem   3. python.exe found on PATH          (any installed Python)
 rem   4. python.exe of a conda env that was created earlier
-rem If none of them has the requirements, the first Python 3.8+ found is used
-rem and the requirements are installed into it.
+rem An activated environment wins over a leftover .venv folder, because
+rem "conda activate" is an explicit choice and a stale .venv would otherwise
+rem hijack the run. If none of them has the requirements, the first Python 3.8+
+rem found is used and the requirements are installed into it.
 rem ---------------------------------------------------------------------------
 set "PYTHON="
 set "PYTHON_FALLBACK="
-
-if exist ".venv\Scripts\python.exe" call :probe ".venv\Scripts\python.exe"
-if defined PYTHON goto have_python
+set "PYTHON_KIND="
 
 if not defined CONDA_PREFIX goto skip_conda
 if not exist "%CONDA_PREFIX%\python.exe" goto skip_conda
 call :probe "%CONDA_PREFIX%\python.exe"
-if defined PYTHON goto have_python
+if not defined PYTHON goto skip_conda
+rem CONDA_DEFAULT_ENV holds the env name ("base", "coursera_env", ...).
+if defined CONDA_DEFAULT_ENV (
+  set "PYTHON_KIND=conda environment %CONDA_DEFAULT_ENV%"
+) else (
+  set "PYTHON_KIND=active conda environment"
+)
+goto have_python
 :skip_conda
 
+if exist ".venv\Scripts\python.exe" call :probe ".venv\Scripts\python.exe"
+if defined PYTHON set "PYTHON_KIND=.venv"
+if defined PYTHON goto have_python
+
 for /f "delims=" %%P in ('where python 2^>nul') do if not defined PYTHON call :probe "%%P"
+if defined PYTHON set "PYTHON_KIND=python on PATH"
 if defined PYTHON goto have_python
 
 rem The "py" launcher is often available even when python is not on PATH.
 for /f "delims=" %%P in ('py -3 -c "import sys;sys.stdout.write(sys.executable)" 2^>nul') do if not defined PYTHON call :probe "%%P"
+if defined PYTHON set "PYTHON_KIND=py launcher"
 if defined PYTHON goto have_python
 
 for /d %%E in ("%USERPROFILE%\.conda\envs\*") do if not defined PYTHON call :probe "%%~fE\python.exe"
@@ -52,9 +65,12 @@ if defined PYTHON goto have_python
 
 if defined PYTHON_FALLBACK set "PYTHON=%PYTHON_FALLBACK%"
 if not defined PYTHON goto no_python
+if not defined PYTHON_KIND set "PYTHON_KIND=an existing conda environment"
 
 :have_python
-echo Using: %PYTHON%
+if not defined PYTHON_KIND set "PYTHON_KIND=an existing interpreter"
+echo Using %PYTHON_KIND%:
+echo   %PYTHON%
 
 "%PYTHON%" -c "import requests, bs4, rookiepy" >nul 2>&1
 if not errorlevel 1 goto deps_ok
@@ -118,9 +134,14 @@ echo "Add python.exe to PATH", or create a virtual environment:
 echo   python -m venv .venv
 echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
 echo.
-echo If you use conda, open "Anaconda Prompt", activate your environment
+echo If you use Anaconda, open the "Anaconda Prompt" from the Start menu,
+echo activate your environment and run this file from that window:
 echo   conda activate coursera_env
-echo and run this file from that window.
+echo   cd /d "%~dp0"
+echo   start_web_app.bat
+echo.
+echo If "conda" is not recognised in a normal cmd window, run this once:
+echo   conda init cmd.exe
 pause
 exit /b 1
 

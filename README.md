@@ -61,16 +61,41 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 2. Clone the repository and navigate to the directory.
 3. Install dependencies: `pip install -r requirements.txt`
 
-A virtual environment is optional. If a `.venv` folder exists next to `web_app.py`, `start_web_app.bat` uses it; otherwise it uses the active conda environment or the `python` on your PATH, and installs `requirements.txt` into it when something is missing. There is no Node.js/npm build step - `web/` is plain HTML/CSS/JS served by the Python app.
+A virtual environment is optional. `start_web_app.bat` picks an interpreter automatically, in this order:
 
-Conda users:
+1. the **activated conda environment** (`%CONDA_PREFIX%\python.exe`)
+2. a `.venv` folder next to `web_app.py`
+3. `python` on your `PATH` (including the `py` launcher)
+4. a previously created conda environment
+
+If the chosen interpreter is missing packages it runs `pip install -r requirements.txt` for you. There is no Node.js/npm build step - `web/` is plain HTML/CSS/JS served by the Python app.
+
+## Running with Anaconda (Windows)
+
+Open the **Anaconda Prompt** from the Start menu (not the plain `cmd` window, which does not know the `conda` command unless you ran `conda init cmd.exe`):
 
 ```bat
 conda create -n coursera_env python=3.10 -y
 conda activate coursera_env
+cd /d C:\Users\<you>\Desktop\Coursera-Downloader
 pip install -r requirements.txt
 start_web_app.bat
 ```
+
+The launcher prints `Using conda environment coursera_env:` followed by the interpreter path, so you can confirm your environment is the one running. Then open <http://localhost:7500>.
+
+Alternatively, without activating anything - run the env's Python directly:
+
+```bat
+conda run -n coursera_env python -m pip install -r requirements.txt
+conda run -n coursera_env python web_app.py
+```
+
+Notes:
+
+- You do **not** need to create a `.venv`. If an old `.venv` folder is left in the project, an activated conda environment still takes priority.
+- Keep the console window open while downloading; it is the app's server.
+- To leave the environment later: `conda deactivate`.
 
 # Usage
 
