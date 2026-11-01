@@ -2,6 +2,7 @@ import argparse
 import base64
 import html
 import json
+import shutil
 import logging
 import mimetypes
 import os
@@ -60,6 +61,10 @@ def disable_console_quick_edit():
 # How many log entries to keep in memory per job. A long course produces
 # thousands of lines; the old 500 cap silently dropped the beginning.
 LOG_RETENTION = 20000
+
+# Upper bound for concurrent file downloads. Each job opens its own connection,
+# so this is a politeness limit towards Coursera as much as a sanity check.
+MAX_PARALLEL_JOBS = 8
 
 _LEVEL_PATTERNS = (
     ("ERROR", ("ERROR:", "Traceback (most recent call last)", "CRITICAL:")),
@@ -164,6 +169,34 @@ class DownloadJob:
             if self.last_payload is None:
                 raise RuntimeError("No previous download request to retry.")
             return dict(self.last_payload), self.last_resume
+
+    def wait_for_stop(self, timeout=10):
+        """Block until the job thread has really finished (used before deleting).
+
+        Returns True if it stopped in time. The writer keeps file handles open
+        until the thread exits, and deleting under it both fails on Windows and
+        can leave a half-removed folder.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if not self.running:
+                    return True
+            time.sleep(0.1)
+        with self.lock:
+            return not self.running
+
+    def running_course(self, course_input, download_path):
+        """True when this exact course is the one being downloaded right now."""
+        with self.lock:
+            if not self.running or not self.last_payload:
+                return False
+            last_course = self.last_payload.get("course", "").strip()
+            last_path = self.last_payload.get("path", "").strip()
+        return (
+            last_course == (course_input or "").strip()
+            and Path(last_path).expanduser() == Path(download_path or "").expanduser()
+        )
 
     def has_request_for(self, course_input, download_path):
         with self.lock:
@@ -1240,6 +1273,89 @@ def is_path_within_allowed_roots(path):
     return False
 
 
+def is_safe_delete_target(target, download_root):
+    """Guard rails for deleting a course folder.
+
+    Deleting files is the one destructive thing this app can do, so every check
+    below is deliberate: the target must sit *inside* the chosen download
+    folder (never the folder itself, never a parent, never the app folder), and
+    it must not be a drive root, the home directory, or a symlink escape.
+    """
+    try:
+        target = Path(target).expanduser().resolve()
+        root = Path(download_root).expanduser().resolve()
+    except OSError:
+        return False, "The folder path could not be resolved."
+
+    if not target.exists():
+        return False, "That folder no longer exists."
+
+    if not target.is_dir():
+        return False, "That path is a file, not a course folder."
+
+    # Refuse to delete the download folder itself.
+    if target == root:
+        return False, "Refusing to delete the whole download folder."
+
+    # Must be a strict child of the download folder.
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False, "That folder is outside the download folder."
+
+    # Never touch the app's own directory or anything above it.
+    try:
+        if target == ROOT or ROOT in target.parents:
+            return False, "Refusing to delete the application folder."
+    except OSError:
+        return False, "The folder path could not be checked."
+
+    if target == Path(target.anchor):
+        return False, "Refusing to delete a drive root."
+
+    try:
+        if target == Path.home().resolve():
+            return False, "Refusing to delete the home directory."
+    except OSError:
+        pass
+
+    return True, ""
+
+
+def folder_delete_summary(target):
+    """Count what would be removed, so the UI can warn honestly."""
+    files = 0
+    size = 0
+    for entry in Path(target).expanduser().resolve().rglob("*"):
+        if entry.is_file():
+            files += 1
+            try:
+                size += entry.stat().st_size
+            except OSError:
+                pass
+    return {"files": files, "bytes": size}
+
+
+def delete_course_folder(target, download_root):
+    """Delete one course folder after validating it. Returns a summary."""
+    allowed, reason = is_safe_delete_target(target, download_root)
+    if not allowed:
+        raise ValueError(reason)
+
+    target = Path(target).expanduser().resolve()
+    summary = folder_delete_summary(target)
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        # Windows often refuses while a file is still open (just-cancelled
+        # downloads keep a handle for a moment). Report it instead of pretending.
+        raise ValueError(
+            "Could not delete the folder: %s. If a download was just running, "
+            "wait a couple of seconds and try again." % exc
+        ) from exc
+    return summary
+
+
 def choose_download_folder(initial_path):
     initial_dir = Path(initial_path or default_download_folder()).expanduser()
     if not initial_dir.exists():
@@ -1368,6 +1484,18 @@ def build_download_command(payload, resume=False, item=None):
     if resolution not in {"360p", "540p", "720p"}:
         raise ValueError("Choose a valid video resolution.")
 
+    raw_jobs = payload.get("jobs", 1)
+    # `0 or 1` would silently become 1, hiding a bad value; treat empty as the
+    # default but validate anything else strictly.
+    if raw_jobs in (None, ""):
+        raw_jobs = 1
+    try:
+        jobs = int(raw_jobs)
+    except (TypeError, ValueError):
+        raise ValueError("Choose how many files to download at once.")
+    if jobs < 1 or jobs > MAX_PARALLEL_JOBS:
+        raise ValueError("Download at once must be between 1 and %d." % MAX_PARALLEL_JOBS)
+
     if language_name not in general.LANG_NAME_TO_CODE_MAPPING:
         raise ValueError("Choose a valid subtitle language.")
 
@@ -1401,7 +1529,7 @@ def build_download_command(payload, resume=False, item=None):
         "--combined-section-lectures-nums",
         "--cache-syllabus",
         "--jobs",
-        "1",
+        str(jobs),
     ]
 
     if is_multi_course_program and len(class_names) > 1:
@@ -2499,6 +2627,12 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/cancel":
                 self.cancel_download()
                 return
+            if parsed.path == "/api/delete-course":
+                self.delete_course(payload)
+                return
+            if parsed.path == "/api/course-delete-info":
+                self.course_delete_info(payload)
+                return
             if parsed.path == "/api/select-folder":
                 self.select_folder(payload)
                 return
@@ -2555,6 +2689,62 @@ class WebHandler(BaseHTTPRequestHandler):
     def cancel_download(self):
         JOB.cancel()
         self.send_json({"ok": True, "status": JOB.snapshot()})
+
+    def course_delete_info(self, payload):
+        """Report what a delete would remove, so the UI can ask before acting."""
+        target = str(payload.get("course_folder", "")).strip()
+        download_path = str(payload.get("path", "")).strip()
+        if not target or not download_path:
+            raise ValueError("Choose a course first.")
+        allowed, reason = is_safe_delete_target(target, download_path)
+        if not allowed:
+            self.send_json({"allowed": False, "reason": reason})
+            return
+        summary = folder_delete_summary(target)
+        busy = JOB.running_course(payload.get("course", ""), download_path)
+        self.send_json({
+            "allowed": True,
+            "reason": "",
+            "files": summary["files"],
+            "bytes": summary["bytes"],
+            "is_running": busy,
+            "folder": target,
+        })
+
+    def delete_course(self, payload):
+        target = str(payload.get("course_folder", "")).strip()
+        download_path = str(payload.get("path", "")).strip()
+        if not target or not download_path:
+            raise ValueError("Choose a course first.")
+
+        # Deleting the folder of a live download would fight the writer and leave
+        # a torn tree, so stop the job first and give it a moment to unwind.
+        stopped = False
+        if JOB.running_course(payload.get("course", ""), download_path):
+            try:
+                JOB.cancel()
+                stopped = True
+            except RuntimeError:
+                pass
+            JOB.wait_for_stop(timeout=10)
+
+        summary = delete_course_folder(target, download_path)
+        JOB.add_log(
+            "Deleted course folder %s (%d files, %.1f MB)%s"
+            % (
+                target,
+                summary["files"],
+                summary["bytes"] / (1024.0 * 1024.0),
+                " after stopping the running download" if stopped else "",
+            )
+        )
+        self.send_json({
+            "ok": True,
+            "stopped_download": stopped,
+            "files": summary["files"],
+            "bytes": summary["bytes"],
+            "status": JOB.snapshot(),
+        })
 
     def select_folder(self, payload):
         selected = choose_download_folder(payload.get("path", ""))

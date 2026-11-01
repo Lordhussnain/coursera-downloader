@@ -4,7 +4,20 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261102-progress3">
+    <link rel="stylesheet" href="/styles.css?v=20261103-features">
+    <script>
+      // Applied before the body renders so a dark-theme user never sees a
+      // white flash while the stylesheet loads.
+      (function () {
+        try {
+          var stored = localStorage.getItem("courseraDownloader.theme");
+          var dark = stored
+            ? stored === "dark"
+            : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          if (dark) document.documentElement.setAttribute("data-theme", "dark");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <main class="app-shell">
@@ -17,6 +30,7 @@
           </div>
           <div class="header-actions">
             <button type="button" class="secondary" id="loginCheckBtn">Login</button>
+            <button type="button" class="secondary icon-toggle" id="themeToggleBtn" aria-label="Toggle dark theme" title="Toggle dark theme"></button>
             <button type="button" class="secondary settings-toggle" id="settingsToggleBtn" aria-label="Settings" title="Settings"></button>
           </div>
         </header>
@@ -54,6 +68,19 @@
                     <label><input type="radio" name="video_resolution" value="540p">540p</label>
                     <label><input type="radio" name="video_resolution" value="360p">360p</label>
                   </div>
+                </div>
+
+                <div class="field">
+                  <label for="jobs">Files at once</label>
+                  <select id="jobs" name="jobs">
+                    <option value="1">1 (safest)</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4" selected>4 (fast)</option>
+                    <option value="6">6</option>
+                    <option value="8">8 (max)</option>
+                  </select>
+                  <p class="field-hint">How many files download in parallel. Higher is faster but uses more bandwidth and connections.</p>
                 </div>
 
                 <div class="field">
@@ -127,6 +154,8 @@
             <div class="tree-toolbar">
               <button type="button" class="secondary small" id="expandTreeBtn">Expand all</button>
               <button type="button" class="secondary small" id="collapseTreeBtn">Collapse all</button>
+              <button type="button" class="secondary small danger" id="deleteCourseBtn" hidden
+                      title="Delete this course folder from disk">Delete course</button>
             </div>
             <aside class="activity-tree" id="activityTree"></aside>
           </div>
@@ -155,6 +184,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261102-progress3"></script>
+    <script src="/app.js?v=20261103-features"></script>
   </body>
 </html>

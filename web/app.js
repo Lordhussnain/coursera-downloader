@@ -15,6 +15,8 @@ const refreshBtn = document.querySelector("#refreshBtn");
 const selectFolderBtn = document.querySelector("#selectFolderBtn");
 const loginCheckBtn = document.querySelector("#loginCheckBtn");
 const settingsToggleBtn = document.querySelector("#settingsToggleBtn");
+const themeToggleBtn = document.querySelector("#themeToggleBtn");
+const deleteCourseBtn = document.querySelector("#deleteCourseBtn");
 const settingsPanel = document.querySelector("#settingsPanel");
 const expandTreeBtn = document.querySelector("#expandTreeBtn");
 const collapseTreeBtn = document.querySelector("#collapseTreeBtn");
@@ -48,6 +50,8 @@ let logEntries = [];
 let logCursor = 0;
 let logHiddenBefore = 0;
 let downloadCount = 0;
+let currentCourseFolder = "";
+let currentCourseName = "";
 let lastProgressKey = "";
 let loginOpened = false;
 let authPollTimer = null;
@@ -78,7 +82,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261102-progress3");
+console.info("Coursera Downloader UI loaded: 20261103-features");
 
 // Restore log view preferences. Reading them here (not at first poll) means the
 // filter is already correct when the first lines arrive.
@@ -160,6 +164,37 @@ function fillSelect(select, items, selected) {
   });
 }
 
+const JOBS_STORAGE_KEY = "courseraDownloader.jobs";
+
+function restoreJobsPreference() {
+  const select = document.querySelector("#jobs");
+  if (!select) return;
+  try {
+    const saved = localStorage.getItem(JOBS_STORAGE_KEY);
+    if (saved) {
+      const option = Array.from(select.options).find((o) => o.value === saved);
+      if (option) select.value = saved;
+    }
+  } catch {
+    /* ignore unavailable storage */
+  }
+}
+
+// Wire the control once, at load, so it works even before the first download
+// state request completes.
+(function initJobsPreference() {
+  restoreJobsPreference();
+  const select = document.querySelector("#jobs");
+  if (!select) return;
+  select.addEventListener("change", () => {
+    try {
+      localStorage.setItem(JOBS_STORAGE_KEY, select.value);
+    } catch {
+      /* ignore */
+    }
+  });
+})();
+
 function payloadFromForm() {
   const formData = new FormData(form);
   return {
@@ -167,6 +202,7 @@ function payloadFromForm() {
     path: formData.get("path"),
     video_resolution: formData.get("video_resolution"),
     subtitle_language: formData.get("subtitle_language"),
+    jobs: Number(formData.get("jobs")) || 1,
   };
 }
 
@@ -702,6 +738,7 @@ function renderStatus(status) {
   }
 
   renderProgress(status);
+  updateDeleteButton();
 
   renderLogStream();
   syncLogPaneVisibility();
@@ -1513,6 +1550,9 @@ async function performDownloadStateUpdate(options = {}) {
       body: JSON.stringify(payloadFromForm()),
     });
     canResumeCurrentCourse = Boolean(state.can_resume);
+    currentCourseFolder = state.course_folder || "";
+    currentCourseName = state.class_name || "";
+    updateDeleteButton();
     if (state.resume_path && pathInput.value !== state.resume_path) {
       pathInput.value = state.resume_path;
     }
@@ -1928,6 +1968,40 @@ function scheduleDownloadStateUpdate() {
 courseInput.addEventListener("input", scheduleDownloadStateUpdate);
 pathInput.addEventListener("input", scheduleDownloadStateUpdate);
 
+const THEME_STORAGE_KEY = "courseraDownloader.theme";
+
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === "dark") {
+    root.setAttribute("data-theme", "dark");
+  } else {
+    root.removeAttribute("data-theme");
+  }
+  if (themeToggleBtn) {
+    const label = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+    themeToggleBtn.setAttribute("aria-label", label);
+    themeToggleBtn.title = label;
+    themeToggleBtn.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+  }
+}
+
+if (themeToggleBtn) {
+  applyTheme(currentTheme());
+  themeToggleBtn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    applyTheme(next);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch {
+      /* private mode: the theme just will not persist */
+    }
+  });
+}
+
 settingsToggleBtn.addEventListener("click", () => {
   setSettingsVisible(settingsPanel.hasAttribute("hidden"), true);
 });
@@ -1948,6 +2022,95 @@ activityTree.addEventListener("click", (event) => {
   selectedTreeView = "content";
   renderSelectedTreeNode();
 });
+
+function updateDeleteButton() {
+  if (!deleteCourseBtn) return;
+  const hasCourse = Boolean(currentCourseFolder);
+  deleteCourseBtn.hidden = !hasCourse;
+  if (hasCourse) {
+    const running = Boolean(currentStatus && currentStatus.running);
+    deleteCourseBtn.title = running
+      ? "Stops the running download, then deletes this course folder"
+      : "Delete this course folder from disk";
+  }
+}
+
+function formatBytesForDialog(bytes) {
+  const size = Number(bytes) || 0;
+  if (size <= 0) return "0 bytes";
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
+  return `${(size / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+async function deleteCourse() {
+  if (!currentCourseFolder) return;
+  const payload = {
+    course: courseInput.value.trim(),
+    path: pathInput.value.trim(),
+    course_folder: currentCourseFolder,
+  };
+
+  // Ask the server what will be removed before doing anything destructive.
+  let info;
+  try {
+    info = await requestJson("/api/course-delete-info", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    showMessage(error.message);
+    return;
+  }
+  if (!info.allowed) {
+    showMessage(info.reason || "This folder cannot be deleted.");
+    return;
+  }
+
+  const running = Boolean(info.is_running);
+  const lines = [
+    `Delete "${currentCourseName || "this course"}"?`,
+    "",
+    `Folder: ${info.folder}`,
+    `Contents: ${info.files} file${info.files === 1 ? "" : "s"} (${formatBytesForDialog(info.bytes)})`,
+    "",
+  ];
+  if (running) {
+    lines.push("A download is running for this course. It will be stopped first.");
+  } else {
+    lines.push("This permanently removes the downloaded files from disk.");
+  }
+  if (!window.confirm(lines.join("\n"))) return;
+
+  deleteCourseBtn.disabled = true;
+  try {
+    const result = await requestJson("/api/delete-course", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    currentCourseFolder = "";
+    downloadedActivityGroups = [];
+    updateDeleteButton();
+    renderStatus(result.status || { running: false, status: "idle" });
+    showMessage(
+      `Deleted ${result.files} file${result.files === 1 ? "" : "s"}${
+        result.stopped_download ? " after stopping the download" : ""
+      }.`,
+      true
+    );
+    await updateDownloadState({ force: true, render: true });
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    deleteCourseBtn.disabled = false;
+  }
+}
+
+if (deleteCourseBtn) {
+  deleteCourseBtn.addEventListener("click", () => {
+    void deleteCourse();
+  });
+}
 
 expandTreeBtn.addEventListener("click", () => {
   userChangedExpansion = true;
