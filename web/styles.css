@@ -1119,3 +1119,183 @@ button.bad {
     flex-wrap: wrap;
   }
 }
+
+/* ---------- Live job progress ---------- */
+.job-progress {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #d7dce2);
+  border-radius: 10px;
+  background: var(--surface-muted, #f7f9fb);
+}
+
+.job-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.job-progress-label {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.job-progress-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  color: var(--text-muted, #5b6672);
+}
+
+.job-progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.09);
+  overflow: hidden;
+}
+
+.job-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2f6df6, #4f92ff);
+  transition: width 0.25s ease;
+}
+
+/* Indeterminate state: we know it is working but not how much is left. */
+.job-progress-track.indeterminate .job-progress-fill {
+  width: 35% !important;
+  animation: job-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes job-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+.job-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 7px;
+  font-size: 0.8rem;
+  color: var(--text-muted, #5b6672);
+}
+
+.job-progress-file {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 62%;
+}
+
+.job-progress-stats {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---------- Log panel ---------- */
+.log-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 2px 8px;
+  flex-wrap: wrap;
+}
+
+.log-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.log-count {
+  font-size: 0.78rem;
+  color: var(--text-muted, #5b6672);
+  font-variant-numeric: tabular-nums;
+}
+
+.log-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.log-filter {
+  font-size: 0.8rem;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #d7dce2);
+  background: #fff;
+}
+
+.log-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.8rem;
+  color: var(--text-muted, #5b6672);
+  white-space: nowrap;
+}
+
+/* Level colouring, applied per line inside the log view. */
+.log-line-error { color: #b42318; font-weight: 600; }
+.log-line-warning { color: #b54708; }
+.log-line-debug { color: #667085; }
+.log-line-info { color: inherit; }
+
+/* ---------- Live log stream ---------- */
+.log-panel {
+  border-left: 1px solid var(--line);
+  min-height: 0;
+}
+
+.log-stream {
+  overflow: auto;
+  min-height: 0;
+  padding: 4px 18px 18px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #111827;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-stream:focus-visible {
+  outline: 2px solid #2f6df6;
+  outline-offset: -2px;
+}
+
+.log-time {
+  color: #98a2b3;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-line {
+  padding: 1px 0;
+}
+
+.log-line-error .log-time,
+.log-line-warning .log-time {
+  color: inherit;
+  opacity: 0.6;
+}
+
+@media (max-width: 900px) {
+  .log-panel {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+}

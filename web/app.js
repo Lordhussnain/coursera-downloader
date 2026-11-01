@@ -5,6 +5,7 @@ const pathInput = document.querySelector("#path");
 const versionLabel = document.querySelector("#version");
 const messageBox = document.querySelector("#message");
 const logs = document.querySelector("#logs");
+const logStream = document.querySelector("#logStream");
 const activityTree = document.querySelector("#activityTree");
 const jobState = document.querySelector("#jobState");
 const downloadBtn = document.querySelector("#downloadBtn");
@@ -27,8 +28,27 @@ const authCauthInput = document.querySelector("#auth_cauth");
 const authApplyBtn = document.querySelector("#authApplyBtn");
 const authHint = document.querySelector("#authHint");
 const activityBody = document.querySelector("#activityBody");
+const jobProgress = document.querySelector("#jobProgress");
+const jobProgressLabel = document.querySelector("#jobProgressLabel");
+const jobProgressCount = document.querySelector("#jobProgressCount");
+const jobProgressTrack = document.querySelector("#jobProgressTrack");
+const jobProgressFill = document.querySelector("#jobProgressFill");
+const jobProgressFile = document.querySelector("#jobProgressFile");
+const jobProgressStats = document.querySelector("#jobProgressStats");
+const logCount = document.querySelector("#logCount");
+const logLevelFilter = document.querySelector("#logLevelFilter");
+const logAutoScroll = document.querySelector("#logAutoScroll");
+const logCopyBtn = document.querySelector("#logCopyBtn");
+const logClearBtn = document.querySelector("#logClearBtn");
 
 let statusTimer = null;
+// Live log buffer. The server streams only entries newer than logCursor, so a
+// long course never re-sends (or silently truncates) its whole log.
+let logEntries = [];
+let logCursor = 0;
+let logHiddenBefore = 0;
+let downloadCount = 0;
+let lastProgressKey = "";
 let loginOpened = false;
 let authPollTimer = null;
 let loginWindow = null;
@@ -58,7 +78,22 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261101-profiles3");
+console.info("Coursera Downloader UI loaded: 20261102-progress3");
+
+// Restore log view preferences. Reading them here (not at first poll) means the
+// filter is already correct when the first lines arrive.
+try {
+  const savedLevel = localStorage.getItem("courseraDownloader.logLevel");
+  if (savedLevel && document.querySelector("#logLevelFilter")) {
+    document.querySelector("#logLevelFilter").value = savedLevel;
+  }
+  const savedScroll = localStorage.getItem("courseraDownloader.logAutoScroll");
+  if (savedScroll !== null && document.querySelector("#logAutoScroll")) {
+    document.querySelector("#logAutoScroll").checked = savedScroll !== "0";
+  }
+} catch {
+  /* localStorage can be unavailable in private mode */
+}
 
 function treeNeedsStateRender() {
   return (
@@ -420,7 +455,6 @@ async function loadBrowserProfiles(config) {
     const data = await requestJson("/api/browser-profiles", { method: "POST", body: "{}" });
     profiles = data.profiles || [];
   } catch (error) {
-    console.debug("Could not list browser profiles", error);
   }
 
   authProfileSelect.innerHTML = "";
@@ -505,17 +539,173 @@ function restoreAuth() {
   return false;
 }
 
+const LOG_LEVEL_RANK = { debug: 0, info: 1, warning: 2, error: 3 };
+
+function logLevelName(entry) {
+  return String((entry && entry.level) || "INFO").toLowerCase();
+}
+
+function applyLogEntries(entries, resync) {
+  if (!entries || !entries.length) return;
+  if (resync) {
+    // The server dropped older lines; restart cleanly rather than leave a hole.
+    logEntries = [];
+    logHiddenBefore = 0;
+  }
+  entries.forEach((entry) => {
+    if (!entry || typeof entry.seq !== "number") return;
+    if (entry.seq <= logCursor) return;
+    logCursor = entry.seq;
+    logEntries.push(entry);
+  });
+  // Keep the browser responsive: an hour-long course can log 100k lines.
+  const MAX_VIEW = 5000;
+  if (logEntries.length > MAX_VIEW) {
+    const dropped = logEntries.length - MAX_VIEW;
+    logEntries = logEntries.slice(dropped);
+    logHiddenBefore += dropped;
+  }
+}
+
+function visibleLogEntries() {
+  const min = logLevelFilter ? logLevelFilter.value : "all";
+  if (min === "all") return logEntries;
+  const threshold = min === "info" ? 1 : min === "warning" ? 2 : 3;
+  return logEntries.filter((entry) => (LOG_LEVEL_RANK[logLevelName(entry)] || 1) >= threshold);
+}
+
+function renderLogStream() {
+  if (!logStream) return;
+  const entries = visibleLogEntries();
+  const total = logEntries.length + logHiddenBefore;
+  if (logCount) {
+    logCount.textContent = total
+      ? `${entries.length} of ${total} lines${logHiddenBefore ? " (older lines dropped)" : ""}`
+      : "";
+  }
+  if (!entries.length) {
+    logStream.innerHTML = `<div class="activity-note">${
+      total ? "No lines match this filter." : "No log lines yet."
+    }</div>`;
+    return;
+  }
+  logStream.innerHTML = entries
+    .map((entry) => {
+      const level = logLevelName(entry);
+      const time = entry.time ? `<span class="log-time">${escapeHtml(entry.time)}</span> ` : "";
+      return `<div class="log-line log-line-${level}">${time}${escapeHtml(entry.message || "")}</div>`;
+    })
+    .join("");
+  if (!logAutoScroll || logAutoScroll.checked) {
+    logStream.scrollTop = logStream.scrollHeight;
+  }
+}
+
+function syncLogPaneVisibility() {
+  // While a job streams lines, the raw log is the useful pane; the grouped tree
+  // detail is what the user wants once it has finished.
+  if (!logs || !logStream) return;
+  const streaming = logEntries.length > 0 && Boolean(currentStatus.running);
+  logs.hidden = streaming;
+  logStream.hidden = !streaming;
+}
+
+function formatBytesShort(value) {
+  const size = Number(value) || 0;
+  if (size <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
+  const scaled = size / Math.pow(1024, index);
+  return `${scaled.toFixed(scaled >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+function renderProgress(status) {
+  if (!jobProgress) return;
+  const progress = status.progress || {};
+  const running = Boolean(status.running);
+  const paused = Boolean(status.paused);
+  const total = Number(progress.total) || 0;
+  const done = Number(progress.bytes) || 0;
+
+  // Per-file percentage while a file transfers, otherwise an indeterminate bar
+  // so the user can still see that work is happening.
+  const hasFileProgress = running && total > 0 && done > 0;
+  const percent = hasFileProgress ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  if (!running) {
+    jobProgress.hidden = true;
+    return;
+  }
+
+  jobProgress.hidden = false;
+  jobProgressTrack.classList.toggle("indeterminate", !hasFileProgress);
+  jobProgressTrack.setAttribute("aria-valuenow", String(hasFileProgress ? percent : 0));
+  jobProgressFill.style.width = hasFileProgress ? `${percent}%` : "35%";
+
+  const statusText = paused ? "Paused" : status.status === "canceling" ? "Canceling" : "Downloading";
+  jobProgressLabel.textContent = statusText;
+  jobProgressCount.textContent = hasFileProgress
+    ? `${percent}% — ${formatBytesShort(done)} of ${formatBytesShort(total)}`
+    : `${downloadCount} file${downloadCount === 1 ? "" : "s"} handled`;
+
+  if (progress.filename) {
+    const name = String(progress.filename).split(/[\\/]/).pop();
+    jobProgressFile.textContent = name;
+    jobProgressFile.title = progress.filename;
+  } else {
+    jobProgressFile.textContent = "";
+    jobProgressFile.title = "";
+  }
+
+  const parts = [];
+  if (progress.speed > 0) {
+    parts.push(`${formatBytesShort(progress.speed)}/s`);
+    if (hasFileProgress && progress.speed > 0) {
+      parts.push(`~${formatDuration((total - done) / progress.speed)} left`);
+    }
+  }
+  if (status.started_at) {
+    const elapsed = (status.finished_at || Date.now() / 1000) - status.started_at;
+    parts.push(`elapsed ${formatDuration(elapsed)}`);
+  }
+  jobProgressStats.textContent = parts.join(" · ");
+}
+
 function renderStatus(status) {
+  currentStatus = status;
   const state = status.status || "idle";
   jobState.textContent = state.charAt(0).toUpperCase() + state.slice(1);
   jobState.className = `status-pill ${state}`;
   setRunningState(Boolean(status.running), state);
 
-  if (status.logs && status.logs.length) {
-    renderGroupedLogs(status.logs);
-    logs.scrollTop = logs.scrollHeight;
-  } else if (status.error) {
-    logs.textContent = status.error;
+  // Append only the new log lines the server sent for this poll.
+  if (Array.isArray(status.log_entries)) {
+    applyLogEntries(status.log_entries, status.resync);
+    downloadCount = logEntries.filter((entry) =>
+      /^Downloading /.test(String(entry.message || "")) || /^Downloading: /.test(String(entry.message || ""))
+    ).length;
+  } else if (status.logs && status.logs.length) {
+    applyLogEntries(
+      status.logs.map((line, index) => ({ seq: logCursor + index + 1, time: "", message: String(line), level: "info" })),
+      false
+    );
+  }
+
+  renderProgress(status);
+
+  renderLogStream();
+  syncLogPaneVisibility();
+  if (!logEntries.length && status.error) {
     activityTree.textContent = "Error";
   }
 
@@ -737,12 +927,6 @@ function buildActivityGroups(lines) {
 function renderGroupedLogs(lines) {
   const groups = buildActivityGroups(lines);
   const hasRealCourseLogs = groups.some((group) => group.slug || group.title !== "Session");
-  console.debug("[tree-debug] renderGroupedLogs", {
-    logLines: lines.length,
-    parsedGroups: summarizeActivityGroups(groups),
-    downloadedGroups: summarizeActivityGroups(downloadedActivityGroups),
-    hasRealCourseLogs,
-  });
   if (!downloadedActivityGroups.length) {
     lastSessionLogGroups = groups;
     currentTreeNodes = [];
@@ -795,10 +979,6 @@ function mergeDownloadedActivityGroups(groups) {
       merged.push(group);
     }
   });
-  console.debug("[tree-debug] mergeDownloadedActivityGroups", {
-    liveGroups: summarizeActivityGroups(groups),
-    mergedGroups: summarizeActivityGroups(merged),
-  });
   return merged;
 }
 
@@ -849,23 +1029,6 @@ function renderActivityGroups(groups, options = {}) {
   activityTree.innerHTML = currentSidebarNodes.length
     ? renderTreeNodes(currentSidebarNodes)
     : "";
-  console.debug("[tree-debug] renderActivityGroups", {
-    sourceGroups: summarizeActivityGroups(groups),
-    sidebarNodes: summarizeTreeNodes(currentSidebarNodes),
-    selectedNode: summarizeTreeNode(findTreeNode(currentTreeNodes, selectedTreeId)),
-    selectedNodeChildren: (findTreeNode(currentTreeNodes, selectedTreeId)?.children || []).map(summarizeTreeNode),
-    roots: currentSidebarNodes.map((node) => ({
-      id: node.id,
-      title: node.title,
-      children: node.children.length,
-      files: nodeFileCount(node),
-      expected: node.expectedCount,
-      active: node.active,
-    })),
-    selectedTreeId,
-    activeTreeId,
-    expandedCount: expandedTreeIds.size,
-  });
   renderSelectedTreeNode();
 }
 
@@ -1257,15 +1420,32 @@ function statusText(status, fileCount = null) {
   return "Running";
 }
 
+const STATUS_POLL_ACTIVE_MS = 700;
+const STATUS_POLL_IDLE_MS = 2500;
+
+function startStatusPolling() {
+  // Poll quickly while work is happening so progress looks live, and back off
+  // when idle instead of hammering the server forever.
+  if (statusTimer) {
+    clearInterval(statusTimer);
+  }
+  const delay = currentStatus && currentStatus.running ? STATUS_POLL_ACTIVE_MS : STATUS_POLL_IDLE_MS;
+  statusTimer = setInterval(refreshStatus, delay);
+}
+
 async function refreshStatus() {
-  const status = await requestJson("/api/status");
+  // Ask only for entries after our cursor: keeps each poll small during a
+  // multi-hour download instead of resending thousands of lines every time.
+  const status = await requestJson(`/api/status?since=${logCursor}`);
   renderStatus(status);
   if (status.running) {
     await updateDownloadState({ force: true, render: treeNeedsStateRender() });
   }
   if (!status.running && statusTimer) {
+    // Keep polling slowly so the last lines and the final status still land,
+    // but stop the moment the job is over and nothing is left to stream.
     clearInterval(statusTimer);
-    statusTimer = null;
+    statusTimer = setInterval(refreshStatus, STATUS_POLL_IDLE_MS);
     await updateDownloadState({ render: !(status.logs && status.logs.length) });
   }
 }
@@ -1282,9 +1462,7 @@ async function startDownload(endpoint) {
   rememberCourseInput();
   renderStatus(result.status);
   showMessage(`${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`, true);
-  if (!statusTimer) {
-    statusTimer = setInterval(refreshStatus, 1500);
-  }
+  startStatusPolling();
   await updateDownloadState({ force: true });
 }
 
@@ -1328,7 +1506,6 @@ async function performDownloadStateUpdate(options = {}) {
           }
         }
       } catch (quickError) {
-        console.debug("[tree-debug] quick state failed", quickError);
       }
     }
     const state = await requestJson("/api/download-state", {
@@ -1341,21 +1518,12 @@ async function performDownloadStateUpdate(options = {}) {
     }
     if (Array.isArray(state.activity_groups) && state.activity_groups.length) {
       downloadedActivityGroups = state.activity_groups;
-      console.debug("[tree-debug] updateDownloadState", {
-        canResume: state.can_resume,
-        className: state.class_name,
-        courseFolder: state.course_folder,
-        groups: summarizeActivityGroups(state.activity_groups),
-        running: currentStatus.running,
-        shouldRender,
-      });
       const treeIsPlaceholder = treeNeedsStateRender();
       if ((!currentStatus.running && shouldRender) || treeIsPlaceholder) {
         renderActivityGroups(state.activity_groups);
       }
     }
   } catch (error) {
-    console.debug("[tree-debug] updateDownloadState failed", error);
     canResumeCurrentCourse = false;
   }
   refreshDownloadButton();
@@ -1370,9 +1538,7 @@ async function startItemDownload(action, item) {
   });
   renderStatus(result.status);
   showMessage(`${action === "resume" ? "Resume" : "Retry"} started for ${item.type}.`, true);
-  if (!statusTimer) {
-    statusTimer = setInterval(refreshStatus, 1500);
-  }
+  startStatusPolling();
 }
 
 async function controlDownload(endpoint, message) {
@@ -1381,7 +1547,7 @@ async function controlDownload(endpoint, message) {
   renderStatus(result.status);
   showMessage(message, true);
   if (!statusTimer && result.status.running) {
-    statusTimer = setInterval(refreshStatus, 1500);
+    startStatusPolling();
   }
 }
 
@@ -1796,6 +1962,45 @@ collapseTreeBtn.addEventListener("click", () => {
 });
 
 if (authApplyBtn) {
+  if (logLevelFilter) {
+    logLevelFilter.addEventListener("change", () => {
+      localStorage.setItem("courseraDownloader.logLevel", logLevelFilter.value);
+      renderLogStream();
+    });
+  }
+  if (logCopyBtn) {
+    logCopyBtn.addEventListener("click", async () => {
+      const text = visibleLogEntries()
+        .map((entry) => `[${entry.time || ""}] ${entry.message || ""}`)
+        .join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        logCopyBtn.textContent = "Copied";
+        setTimeout(() => {
+          logCopyBtn.textContent = "Copy";
+        }, 1400);
+      } catch {
+        // Clipboard can be blocked; fall back to selecting the text.
+        logStream.focus();
+        showMessage("Could not copy automatically. Select the log text and copy it manually.");
+      }
+    });
+  }
+  if (logClearBtn) {
+    logClearBtn.addEventListener("click", () => {
+      // Only the view is cleared; logCursor stays so the server keeps sending
+      // anything new, and nothing is lost from the download itself.
+      logEntries = [];
+      logHiddenBefore = 0;
+      renderLogStream();
+    });
+  }
+  if (logAutoScroll) {
+    logAutoScroll.addEventListener("change", () => {
+      localStorage.setItem("courseraDownloader.logAutoScroll", logAutoScroll.checked ? "1" : "0");
+    });
+  }
+
   authApplyBtn.addEventListener("click", () => {
     void applyAuthChoice();
   });

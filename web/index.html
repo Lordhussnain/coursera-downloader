@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261101-profiles3">
+    <link rel="stylesheet" href="/styles.css?v=20261102-progress3">
   </head>
   <body>
     <main class="app-shell">
@@ -98,6 +98,21 @@
         </form>
 
         <section class="message" id="message" hidden></section>
+
+        <section class="job-progress" id="jobProgress" hidden>
+          <div class="job-progress-head">
+            <span class="job-progress-label" id="jobProgressLabel">Downloading</span>
+            <span class="job-progress-count" id="jobProgressCount"></span>
+          </div>
+          <div class="job-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+               aria-valuenow="0" id="jobProgressTrack">
+            <div class="job-progress-fill" id="jobProgressFill"></div>
+          </div>
+          <div class="job-progress-meta">
+            <span id="jobProgressFile" class="job-progress-file"></span>
+            <span id="jobProgressStats" class="job-progress-stats"></span>
+          </div>
+        </section>
       </section>
 
       <section class="activity">
@@ -115,11 +130,31 @@
             </div>
             <aside class="activity-tree" id="activityTree"></aside>
           </div>
-          <div id="logs" class="activity-log"></div>
+          <div class="log-panel">
+            <div class="log-toolbar">
+              <div class="log-title">
+                <strong>Log</strong>
+                <span class="log-count" id="logCount"></span>
+              </div>
+              <div class="log-actions">
+                <select id="logLevelFilter" class="log-filter" aria-label="Minimum log level">
+                  <option value="all">All levels</option>
+                  <option value="info">Info and above</option>
+                  <option value="warning">Warnings and errors</option>
+                  <option value="error">Errors only</option>
+                </select>
+                <label class="log-toggle"><input type="checkbox" id="logAutoScroll" checked> Auto-scroll</label>
+                <button type="button" class="secondary small" id="logCopyBtn" title="Copy the whole log">Copy</button>
+                <button type="button" class="secondary small" id="logClearBtn" title="Clear the view (the download keeps running)">Clear</button>
+              </div>
+            </div>
+            <div id="logs" class="activity-log" hidden></div>
+            <div id="logStream" class="log-stream" tabindex="0"></div>
+          </div>
         </div>
       </section>
     </main>
 
-    <script src="/app.js?v=20261101-profiles3"></script>
+    <script src="/app.js?v=20261102-progress3"></script>
   </body>
 </html>

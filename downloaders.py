@@ -270,6 +270,53 @@ def format_bytes(bytes):
     return '{0:.2f}{1}'.format(converted, suffix)
 
 
+# Live progress for the web UI.
+#
+# The command line prints a carriage-return progress bar to stdout, which a web
+# page can never see. Every file download records itself here instead, and the
+# UI polls this small dict. The command line ignores it entirely.
+PROGRESS = {
+    'filename': '',
+    'url': '',
+    'bytes': 0,
+    'total': 0,
+    'percent': 0,
+    'speed': 0,
+    'started_at': 0,
+    'active': False,
+}
+
+
+def reset_progress():
+    PROGRESS.update({
+        'filename': '', 'url': '', 'bytes': 0, 'total': 0,
+        'percent': 0, 'speed': 0, 'started_at': 0, 'active': False,
+    })
+
+
+def current_progress():
+    """Return a copy of the live download progress, for the web UI."""
+    snapshot = dict(PROGRESS)
+    if snapshot['active'] and snapshot['started_at']:
+        elapsed = time.time() - snapshot['started_at']
+        if elapsed > 0.25:
+            snapshot['speed'] = int(snapshot['bytes'] / elapsed)
+    return snapshot
+
+
+def _publish_progress(filename, url, done, total, started_at):
+    PROGRESS['filename'] = filename or ''
+    PROGRESS['url'] = url or ''
+    PROGRESS['bytes'] = int(done or 0)
+    PROGRESS['total'] = int(total or 0)
+    PROGRESS['started_at'] = started_at or 0
+    PROGRESS['active'] = True
+    if total:
+        PROGRESS['percent'] = int(min(100, float(done) / float(total) * 100.0))
+    else:
+        PROGRESS['percent'] = 0
+
+
 class DownloadProgress(object):
     """
     Report download progress.
@@ -411,6 +458,9 @@ class NativeDownloader(Downloader):
             chunk_sz = 1048576
             progress = DownloadProgress(content_length)
             progress.start()
+            started_at = time.time()
+            base_offset = filesize if (resume and filesize) else 0
+            expected_total = (int(content_length) + base_offset) if content_length else 0
             f = open(filename, 'ab') if resume else open(filename, 'wb')
             try:
                 while True:
@@ -421,10 +471,18 @@ class NativeDownloader(Downloader):
                         progress.stop()
                         break
                     progress.report(r.raw.tell())
+                    _publish_progress(
+                        filename, url,
+                        base_offset + r.raw.tell(),
+                        expected_total,
+                        started_at,
+                    )
                     f.write(data)
             finally:
                 f.close()
                 r.close()
+                PROGRESS['active'] = False
+                PROGRESS['percent'] = 100 if expected_total else PROGRESS['percent']
             return True
 
         if attempts_count == max_attempts:

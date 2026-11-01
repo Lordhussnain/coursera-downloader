@@ -13,7 +13,7 @@ import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import re
 import string
 
@@ -23,7 +23,12 @@ import general
 from app_version import __version__
 from coursera_dl import main_f
 from define import OPENCOURSE_ONDEMAND_SPECIALIZATIONS_V1
-from downloaders import DownloadCancelled, set_download_control_events
+from downloaders import (
+    DownloadCancelled,
+    current_progress,
+    reset_progress,
+    set_download_control_events,
+)
 from localdb import SimpleDB
 
 
@@ -52,6 +57,26 @@ def disable_console_quick_edit():
         logging.debug("Could not disable console QuickEdit mode.", exc_info=True)
 
 
+# How many log entries to keep in memory per job. A long course produces
+# thousands of lines; the old 500 cap silently dropped the beginning.
+LOG_RETENTION = 20000
+
+_LEVEL_PATTERNS = (
+    ("ERROR", ("ERROR:", "Traceback (most recent call last)", "CRITICAL:")),
+    ("WARNING", ("WARNING:", "WARN:")),
+    ("DEBUG", ("DEBUG:",)),
+)
+
+
+def _log_level(message):
+    """Classify a raw log line so the UI can colour it meaningfully."""
+    text = str(message or "")
+    for level, markers in _LEVEL_PATTERNS:
+        if any(marker in text for marker in markers):
+            return level
+    return "INFO"
+
+
 class JobLogHandler(logging.Handler):
     def __init__(self, job):
         super().__init__()
@@ -75,6 +100,7 @@ class DownloadJob:
         self.error = ""
         self.command = []
         self.logs = []
+        self.log_seq = 0
         self.last_payload = None
         self.last_resume = False
         self.cancel_event = threading.Event()
@@ -83,22 +109,49 @@ class DownloadJob:
     def add_log(self, message):
         with self.lock:
             timestamp = time.strftime("%H:%M:%S")
-            self.logs.append(f"[{timestamp}] {message}")
-            self.logs = self.logs[-500:]
+            self.log_seq += 1
+            entry = {
+                "seq": self.log_seq,
+                "time": timestamp,
+                "message": message,
+                "level": _log_level(message),
+            }
+            self.logs.append(entry)
+            # Keep a long history in memory: a full course easily logs more than
+            # the old 500-line cap, and truncation is what made the UI look like
+            # it was "missing" log lines.
+            if len(self.logs) > LOG_RETENTION:
+                del self.logs[: len(self.logs) - LOG_RETENTION]
 
-    def snapshot(self):
+    def snapshot(self, since=0):
+        """Return the job state. `since` streams only newer log entries."""
         with self.lock:
+            since = since or 0
+            if since:
+                entries = [entry for entry in self.logs if entry["seq"] > since]
+                first_seq = self.logs[0]["seq"] if self.logs else 0
+                # Tell the UI when entries were dropped from the front so it can
+                # resync instead of showing a log with holes in it.
+                resync = bool(self.logs) and since < first_seq - 1
+            else:
+                entries = list(self.logs)
+                resync = False
+            logs = ["[%s] %s" % (entry["time"], entry["message"]) for entry in entries]
             return {
                 "running": self.running,
                 "status": self.status,
                 "paused": self.pause_event.is_set(),
                 "error": self.error,
                 "command": redact_command(self.command),
-                "logs": list(self.logs),
+                "logs": logs,
+                "log_entries": entries,
+                "log_seq": self.log_seq,
+                "resync": resync,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "can_retry": self.last_payload is not None,
                 "last_was_resume": self.last_resume,
+                "progress": current_progress(),
             }
 
     def remember_request(self, payload, resume):
@@ -129,6 +182,7 @@ class DownloadJob:
             self.error = ""
             self.command = list(command)
             self.logs = []
+            self.log_seq = 0
             self.started_at = time.time()
             self.finished_at = None
             self.cancel_event.clear()
@@ -169,6 +223,7 @@ class DownloadJob:
         root_logger = logging.getLogger()
         root_logger.addHandler(handler)
         set_download_control_events(self.cancel_event, self.pause_event)
+        reset_progress()
         try:
             self.add_log("Resume started." if "--resume" in command else "Download started.")
             main_f(command)
@@ -189,6 +244,7 @@ class DownloadJob:
         finally:
             set_download_control_events(None, None)
             root_logger.removeHandler(handler)
+            reset_progress()
             with self.lock:
                 self.running = False
                 self.pause_event.clear()
@@ -2397,7 +2453,14 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(load_config())
             return
         if parsed.path == "/api/status":
-            self.send_json(JOB.snapshot())
+            # ?since=<seq> returns only log entries newer than that cursor, so
+            # polling stays cheap even for a course with thousands of lines.
+            query = parse_qs(parsed.query or "")
+            try:
+                since = int((query.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                since = 0
+            self.send_json(JOB.snapshot(since=since))
             return
         self.serve_static(parsed.path)
 
