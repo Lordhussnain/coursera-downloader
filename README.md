@@ -59,19 +59,38 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 
 1. Ensure you have Python 3.8+ installed.
 2. Clone the repository and navigate to the directory.
-3. Create a virtual environment: `python -m venv .venv`
-4. Activate the virtual environment: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Linux/Mac)
-5. Install dependencies: `pip install -r requirements.txt`
-6. For the React frontend, ensure Node.js is installed, then run `npm install` in the `web/` directory.
+3. Install dependencies: `pip install -r requirements.txt`
+
+A virtual environment is optional. If a `.venv` folder exists next to `web_app.py`, `start_web_app.bat` uses it; otherwise it uses the active conda environment or the `python` on your PATH, and installs `requirements.txt` into it when something is missing. There is no Node.js/npm build step - `web/` is plain HTML/CSS/JS served by the Python app.
+
+Conda users:
+
+```bat
+conda create -n coursera_env python=3.10 -y
+conda activate coursera_env
+pip install -r requirements.txt
+start_web_app.bat
+```
 
 # Usage
 
 1. Start the web app: Run `start_web_app.bat` (Windows) or `python web_app.py` (cross-platform).
 2. Open your browser to `http://localhost:7500`.
-3. Log in using your Coursera credentials or CAUTH cookie.
+3. Click **Login**, sign in to Coursera in the browser window that opens, then click **Login** again.
 4. Select and download courses.
 
-**Note**: The app extracts CAUTH cookies from your browser for authentication. Ensure you are logged into Coursera in your browser (Chrome, Firefox, etc.) before use.
+## Login / authentication
+
+The app never asks for your Coursera password. It reuses the `CAUTH` session cookie from a browser you are already signed in to.
+
+- **Firefox is the most reliable source.** Windows protects Chrome and Edge cookies with *app-bound encryption* (Chrome 127+, current Edge). No external program - including this app, even when run as administrator - can read those cookies. When only Chrome/Edge is signed in, auto-detection fails.
+- Choose the browser under **Settings -> Read Coursera login from**, then click **Use this login**.
+- If auto-detection still fails (Chrome/Edge only, or a locked cookie database), paste the cookie manually:
+  1. Sign in at `https://www.coursera.org` in any browser.
+  2. Press `F12` -> **Application** -> **Cookies** -> `https://www.coursera.org`.
+  3. Copy the `CAUTH` value, paste it into **Settings -> CAUTH cookie**, then click **Use this login**.
+
+A CAUTH cookie copied by hand keeps working from any browser, and it is stored locally in `data.bin` (git-ignored) so downloads keep working on the next start.
 
 # Security
 

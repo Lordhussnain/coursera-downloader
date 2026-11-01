@@ -20,6 +20,10 @@ const collapseTreeBtn = document.querySelector("#collapseTreeBtn");
 const courseClearBtn = document.querySelector("#courseClearBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
+const authBrowserSelect = document.querySelector("#auth_browser");
+const authCauthInput = document.querySelector("#auth_cauth");
+const authApplyBtn = document.querySelector("#authApplyBtn");
+const authHint = document.querySelector("#authHint");
 const activityBody = document.querySelector("#activityBody");
 
 let statusTimer = null;
@@ -43,10 +47,15 @@ let lastDownloadStateAt = 0;
 let downloadStatePromise = null;
 const expandedTreeIds = new Set();
 
+const AUTH_BROWSER_STORAGE_KEY = "courseraDownloader.authBrowser";
+const AUTH_HINT_MESSAGE =
+  "Login not detected yet. Sign in to coursera.org in the same browser, then click Login again. " +
+  "Chrome and Edge cookies are protected on Windows, so Firefox is the most reliable choice. " +
+  "You can also paste the CAUTH cookie under Settings.";
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20260503-no-fallback-tree");
+console.info("Coursera Downloader UI loaded: 20261101-auth");
 
 function treeNeedsStateRender() {
   return (
@@ -361,9 +370,28 @@ function cleanAuthMessage(text) {
 function cleanDisplayMessage(text) {
   const message = cleanAuthMessage(text);
   if (/could not auto-detect your coursera login/i.test(message)) {
-    return "Could not auto-detect your Coursera login. Start the app with start_web_app.bat, then click Login again.";
+    return AUTH_HINT_MESSAGE;
   }
   return message;
+}
+
+function authFailureMessage(result) {
+  const details = String((result && result.details) || "").trim();
+  if (!details) return AUTH_HINT_MESSAGE;
+  return `${AUTH_HINT_MESSAGE} Details: ${details}`;
+}
+
+function setAuthHint(text) {
+  if (authHint) authHint.textContent = text;
+}
+
+function authPayload(extra = {}) {
+  const selected = authBrowserSelect ? authBrowserSelect.value.trim() : "";
+  const cauth = authCauthInput ? authCauthInput.value.trim() : "";
+  if (cauth) {
+    return { ...extra, browser: "manual", cauth };
+  }
+  return { ...extra, browser: selected };
 }
 
 function isAuthDetectionFailure(message) {
@@ -382,8 +410,12 @@ function authButtonLabel(text, ok = null, userName = "") {
     return `Welcome, ${loggedInMatch[1].trim()}`;
   }
 
-  if (ok === true && /^logged in\.?$/i.test(message)) {
+  if (ok === true && /^logged in( as\s+.+?)?\.?(\s|$)/i.test(message)) {
     return "Welcome";
+  }
+
+  if (/could not auto-detect your coursera login/i.test(message)) {
+    return "Login not detected";
   }
 
   return message || "Login";
@@ -1189,7 +1221,7 @@ async function startDownload(endpoint) {
   expandedTreeIds.clear();
   const result = await requestJson(endpoint, {
     method: "POST",
-    body: JSON.stringify(payloadFromForm()),
+    body: JSON.stringify(authPayload(payloadFromForm())),
   });
   rememberCourseInput();
   renderStatus(result.status);
@@ -1278,7 +1310,7 @@ async function startItemDownload(action, item) {
   const endpoint = action === "resume" ? "/api/resume-item" : "/api/download-item";
   const result = await requestJson(endpoint, {
     method: "POST",
-    body: JSON.stringify({ ...payloadFromForm(), item }),
+    body: JSON.stringify(authPayload({ ...payloadFromForm(), item })),
   });
   renderStatus(result.status);
   showMessage(`${action === "resume" ? "Resume" : "Retry"} started for ${item.type}.`, true);
@@ -1294,6 +1326,47 @@ async function controlDownload(endpoint, message) {
   showMessage(message, true);
   if (!statusTimer && result.status.running) {
     statusTimer = setInterval(refreshStatus, 1500);
+  }
+}
+
+function restoreAuthBrowser(config) {
+  const stored = localStorage.getItem(AUTH_BROWSER_STORAGE_KEY) || "";
+  if (authBrowserSelect && stored && [...authBrowserSelect.options].some((option) => option.value === stored)) {
+    authBrowserSelect.value = stored;
+  }
+  if (authHint && config && config.auth && config.auth.has_saved_cauth) {
+    authHint.textContent = "A CAUTH cookie is already saved. Paste a new one below only if the login expires.";
+  }
+}
+
+async function applyAuthChoice() {
+  const payload = authPayload();
+  authApplyBtn.disabled = true;
+  loginCheckBtn.disabled = true;
+  clearMessage();
+  try {
+    const result = await requestJson("/api/save-cauth", { method: "POST", body: JSON.stringify(payload) });
+    setAuthMessage(result.message, result.authenticated, result.user_name);
+    if (result.authenticated) {
+      rememberAuth(result);
+      if (payload.browser && payload.browser !== "manual") {
+        localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, payload.browser);
+      }
+      if (payload.cauth && authCauthInput) {
+        authCauthInput.value = "";
+      }
+      showMessage(result.message, true);
+    } else if (isAuthDetectionFailure(result.message)) {
+      showMessage(authFailureMessage(result));
+      setAuthHint(authFailureMessage(result));
+    } else {
+      showMessage(result.message || AUTH_HINT_MESSAGE);
+    }
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    authApplyBtn.disabled = false;
+    loginCheckBtn.disabled = false;
   }
 }
 
@@ -1322,26 +1395,41 @@ async function init() {
     resolutionInput.checked = true;
   }
 
+  restoreAuthBrowser(config);
   const initialDownloadState = updateDownloadState({ force: true, render: true });
   await refreshStatus();
   await initialDownloadState;
-  await checkAuthOnce(false);
+  // Startup shows the hint in the log so it is obvious why downloads may fail;
+  // polling later stays quiet.
+  await checkAuthOnce(true);
 }
 
 async function checkAuthOnce(showResult = true) {
   if (!authCheckPromise) {
-    authCheckPromise = requestJson("/api/check-auth", { method: "POST", body: "{}" })
+    authCheckPromise = requestJson("/api/check-auth", {
+      method: "POST",
+      body: JSON.stringify(authPayload()),
+    })
       .finally(() => {
         authCheckPromise = null;
       });
   }
   const result = await authCheckPromise;
-  setAuthMessage(result.message, result.authenticated, result.user_name);
-  if (result.authenticated) {
+  if (!result.authenticated) {
+    // "Login not detected" is an informative state, not an error: it is the
+    // normal outcome before the user signs in.
+    setAuthMessage(result.message, null, "");
+  } else {
+    setAuthMessage(result.message, true, result.user_name);
     rememberAuth(result);
+    setAuthHint(`Signed in via ${result.browser === "manual" ? "the saved CAUTH cookie" : result.browser || "auto-detect"}.`);
   }
-  if (showResult && !result.authenticated && !isAuthDetectionFailure(result.message)) {
-    showMessage(result.message, result.authenticated);
+  if (showResult && !result.authenticated) {
+    if (isAuthDetectionFailure(result.message)) {
+      showMessage(authFailureMessage(result));
+    } else {
+      showMessage(result.message, result.authenticated);
+    }
   }
   await refreshStatus();
   return result;
@@ -1637,6 +1725,18 @@ collapseTreeBtn.addEventListener("click", () => {
   renderSelectedTreeNode();
 });
 
+if (authApplyBtn) {
+  authApplyBtn.addEventListener("click", () => {
+    void applyAuthChoice();
+  });
+}
+
+if (authBrowserSelect) {
+  authBrowserSelect.addEventListener("change", () => {
+    localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, authBrowserSelect.value);
+  });
+}
+
 loginCheckBtn.addEventListener("click", async () => {
   clearMessage();
   loginCheckBtn.disabled = true;
@@ -1654,6 +1754,7 @@ loginCheckBtn.addEventListener("click", async () => {
       setAuthMessage("Checking login...", null);
       await refreshStatus();
       startAuthPolling();
+      showMessage(cleanDisplayMessage(AUTH_HINT_MESSAGE));
       return;
     }
 

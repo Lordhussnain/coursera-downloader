@@ -200,6 +200,14 @@ JOB = DownloadJob()
 AUTH_LOCK = threading.Lock()
 AUTH_CACHE = None
 AUTH_CACHE_TTL = 60
+AUTH_BROWSER_ORDER = ["firefox", "chrome", "edge", "brave"]
+PROFILE_ENDPOINTS = [
+    "https://api.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
+    "https://www.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
+    "https://www.coursera.org/api/userProfiles.v1?q=me&fields=fullName,name",
+    "https://www.coursera.org/api/users.v1/me?fields=fullName,name",
+    "https://www.coursera.org/api/memberships.v1?q=me&fields=name,fullName,email,emailAddress",
+]
 PROGRAM_COURSE_CACHE = {}
 PROGRAM_COURSE_FALLBACKS = {
     "ibm-ai-product-manager": [
@@ -233,11 +241,31 @@ def redact_command(command):
 
 def friendly_error_message(exc):
     message = str(exc)
-    if "appbound encryption" in message.lower():
+    lowered = message.lower()
+    if "appbound encryption" in lowered or "app-bound" in lowered:
         return (
-            "Browser cookie access failed because Chrome/Edge protects cookies with "
-            "Windows app-bound encryption. Start the app with start_web_app.bat, "
-            "then click Login again."
+            "Chrome/Edge protects its cookies with Windows app-bound encryption, "
+            "so the login cannot be read from that browser. Use another browser "
+            "for Coursera (Firefox works), or paste the CAUTH cookie manually."
+        )
+    if "can't find cookies file" in lowered or "cannot find cookies file" in lowered:
+        return (
+            "No cookie database was found, which usually means the browser is "
+            "not installed or it was never opened."
+        )
+    if "ssl" in lowered or "proxy" in lowered or "max retries exceeded" in lowered:
+        return (
+            "%s. Check your internet connection, VPN, or proxy, then try again."
+            % message
+        )
+    # Only treat a lock/unlock wording as a cookie problem. Plain TLS, network
+    # and proxy errors must not be reported as a browser cookie issue.
+    if ("cookie" in lowered or "database" in lowered) and (
+        "locked" in lowered or "being used by another process" in lowered
+    ):
+        return (
+            "The browser cookie database is locked. Close the browser completely "
+            "(including from the system tray) and click Login again."
         )
     return message
 
@@ -245,12 +273,44 @@ def friendly_error_message(exc):
 def auth_detection_error_message(details):
     logging.debug("Coursera login auto-detection details: %s", details)
     return (
-        "Could not auto-detect your Coursera login. Start the app with "
-        "start_web_app.bat, then click Login again."
+        "Could not auto-detect your Coursera login. Log in at coursera.org in "
+        "Firefox (Chrome/Edge cookies cannot be read on Windows), then click "
+        "Login again. If it still fails, paste the CAUTH cookie under Settings, "
+        "or start the app with start_web_app.bat."
     )
 
 
-def detect_cauth_cookie():
+def normalize_cookie_domain(domain):
+    return str(domain or "").strip().lstrip(".").lower()
+
+
+def cookie_domain_order(cookie):
+    domain = normalize_cookie_domain(cookie.get("domain") if isinstance(cookie, dict) else getattr(cookie, "domain", None))
+    if domain.endswith("coursera.org"):
+        return 0
+    if domain.endswith("coursera.com"):
+        return 1
+    return 2
+
+
+def pick_cookie_value(cookies, name):
+    matches = []
+    for cookie in cookies or []:
+        cookie_name = cookie.get("name") if isinstance(cookie, dict) else getattr(cookie, "name", None)
+        if cookie_name != name:
+            continue
+        value = cookie.get("value") if isinstance(cookie, dict) else getattr(cookie, "value", None)
+        if value:
+            matches.append((-cookie_domain_order(cookie), cookie, value))
+
+    if not matches:
+        return None, None
+
+    matches.sort(key=lambda item: item[0])
+    return matches[0][2], matches[0][1]
+
+
+def read_browser_cookies(browser):
     try:
         import rookiepy
     except ModuleNotFoundError as exc:
@@ -259,66 +319,210 @@ def detect_cauth_cookie():
             "python -m pip install -r requirements.txt, then restart the app."
         ) from exc
 
-    errors = []
-    browser_order = ["firefox", "chrome", "edge", "brave"]
-    for browser in browser_order:
-        if browser not in general.ALLOWED_BROWSERS:
-            continue
-        cookie_loader = getattr(rookiepy, browser, None)
-        if cookie_loader is None:
-            continue
+    cookie_loader = getattr(rookiepy, browser, None)
+    if cookie_loader is None:
+        raise RuntimeError("Unsupported browser: %s" % browser)
 
+    return cookie_loader(["coursera.org"])
+
+
+def iter_cauth_sources(browser="", cookie_value="", failures=None):
+    """Yield (source, cauth_cookie, cookies) for each possible login source.
+
+    `failures` is an optional dict that receives a human readable reason per
+    browser that could not provide a cookie.
+    """
+    failures = failures if failures is not None else {}
+    cookie_value = (cookie_value or "").strip()
+    if cookie_value:
+        yield "manual", cookie_value, None
+        return
+
+    browser = (browser or "").strip().lower()
+    browser_order = [browser] if browser else []
+    for name in AUTH_BROWSER_ORDER:
+        if name not in browser_order:
+            browser_order.append(name)
+
+    for name in browser_order:
+        if name not in general.ALLOWED_BROWSERS:
+            continue
         try:
-            cookies = cookie_loader(["coursera.org"])
+            cookies = read_browser_cookies(name)
         except Exception as exc:
-            errors.append(f"{browser}: {friendly_error_message(exc)}")
+            logging.debug("Could not read %s cookies: %s", name, exc)
+            failures[name] = friendly_error_message(exc)
             continue
 
-        for cookie in cookies:
-            name = cookie.get("name") if isinstance(cookie, dict) else getattr(cookie, "name", None)
-            if name == "CAUTH":
-                value = cookie.get("value") if isinstance(cookie, dict) else getattr(cookie, "value", None)
-                if value:
-                    return browser, value, cookies
+        cauth_cookie, matched_cookie = pick_cookie_value(cookies, "CAUTH")
+        if cauth_cookie:
+            yield name, cauth_cookie, cookies
+            continue
 
-        errors.append(f"{browser}: CAUTH cookie not found")
-
-    detail = "; ".join(errors) if errors else "No supported browser cookie reader was available."
-    raise RuntimeError(auth_detection_error_message(detail))
+        logging.debug("%s returned %d cookies but no CAUTH cookie.", name, len(cookies))
+        failures[name] = "no CAUTH cookie for coursera.org"
 
 
-def detect_auth_status():
-    browser, cauth_cookie, browser_cookies = detect_cauth_cookie()
-    user_name = get_coursera_user_name(cauth_cookie, browser_cookies)
-    message = f"Logged in as {user_name}." if user_name else "Logged in."
-    if not user_name:
-        logging.debug("Authentication detected from %s, but no profile name was found.", browser)
+def report_auth_problem(details):
+    message = auth_detection_error_message(details)
+    logging.debug("Authentication problem: %s", message)
     return {
-        "authenticated": True,
-        "browser": browser,
-        "user_name": user_name,
+        "authenticated": False,
+        "browser": "",
+        "user_name": "",
         "message": message,
+        "warning": "",
+        "details": details,
     }
 
 
-def detect_auth_status_cached():
+def detect_auth_status(browser="", cookie_value=""):
+    details = []
+    failures = {}
+    candidates = 0
+    for source, cauth_cookie, cookies in iter_cauth_sources(browser, cookie_value, failures):
+        candidates += 1
+        profile = fetch_coursera_profile(cauth_cookie, cookies)
+        if not profile.get("verified"):
+            details.append(
+                "%s: Coursera rejected the CAUTH cookie (%s)"
+                % (source, profile.get("error") or "unknown error")
+            )
+            continue
+
+        user_name = profile.get("user_name") or ""
+        message = "Logged in as %s." % user_name if user_name else "Logged in."
+        warning = profile.get("warning") or ""
+        if warning:
+            if source == "manual":
+                # A cookie pasted by the user is trusted until Coursera
+                # explicitly rejects it; the warning is only a heads-up.
+                message = "Logged in. Saved this CAUTH cookie, but Coursera did not return a profile for it. If downloads fail, copy a fresh cookie."
+            else:
+                message = "%s %s" % (message, warning)
+        logging.debug("Authentication detected from %s.", source)
+        return {
+            "authenticated": True,
+            "browser": source,
+            "user_name": user_name,
+            "message": message,
+            "warning": warning,
+            "details": "",
+        }
+
+    if not candidates and cookie_value:
+        details.append("The CAUTH cookie is empty.")
+    elif not candidates:
+        for name in AUTH_BROWSER_ORDER:
+            if name in failures:
+                details.append("%s: %s" % (name, failures[name]))
+        details.append("No CAUTH cookie was found in any supported browser.")
+    return report_auth_problem("; ".join(details))
+
+
+def fetch_coursera_profile(cauth_cookie, browser_cookies=None):
+    """Return {verified, user_name, warning, error} for a CAUTH cookie.
+
+    A cookie is only rejected when Coursera explicitly answers 401/403. Every
+    other outcome (offline, changed API, profile without a display name) keeps
+    the user logged in, because a wrong verdict would block working downloads.
+    """
+    session = requests.Session()
+    apply_browser_cookies(session, browser_cookies)
+    session.cookies.set("CAUTH", cauth_cookie, domain=".coursera.org")
+
+    reachable = False
+    saw_identity = False
+    try:
+        payload_name = get_name_from_cauth(cauth_cookie)
+    except Exception:
+        logging.debug("Could not read the CAUTH payload.", exc_info=True)
+        payload_name = ""
+
+    for endpoint in PROFILE_ENDPOINTS:
+        profile_name, profile_ids, status_code = get_name_from_profile_endpoint(session, endpoint)
+        reachable = reachable or bool(status_code)
+        if status_code in {401, 403}:
+            return {"verified": False, "user_name": "", "warning": "", "error": "HTTP %s" % status_code}
+        if profile_name:
+            return {"verified": True, "user_name": profile_name, "warning": "", "error": ""}
+        if profile_ids:
+            saw_identity = True
+        for profile_id in profile_ids:
+            name = get_name_from_profile_id(session, profile_id)
+            if name:
+                return {"verified": True, "user_name": name, "warning": "", "error": ""}
+
+    # Profile APIs do not always expose a display name; try the account pages.
+    page_name, page_status = get_name_from_coursera_pages(session)
+    reachable = reachable or bool(page_status)
+    if page_name:
+        return {"verified": True, "user_name": page_name, "warning": "", "error": ""}
+    if page_status in {401, 403}:
+        return {"verified": False, "user_name": "", "warning": "", "error": "HTTP %s" % page_status}
+
+    warning = ""
+    if reachable and not saw_identity:
+        warning = (
+            "Coursera did not return a profile for this cookie, so it may be "
+            "expired. Downloads will report an authentication error if so."
+        )
+        logging.debug("CAUTH accepted without profile data: %s", warning)
+    return {
+        "verified": True,
+        "user_name": payload_name,
+        "warning": warning,
+        "error": "",
+    }
+
+
+def get_name_from_profile_id(session, profile_id):
+    for endpoint in profile_endpoints_for_id(profile_id):
+        name, _profile_ids, status_code = get_name_from_profile_endpoint(session, endpoint)
+        if status_code in {401, 403}:
+            continue
+        if name:
+            return name
+    return ""
+
+
+def detect_auth_status_cached(force=False, browser="", cookie_value=""):
     global AUTH_CACHE
 
+    if cookie_value:
+        return detect_auth_status(browser, cookie_value)
+
     now = time.time()
-    if AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
+    if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
         return dict(AUTH_CACHE["status"])
 
     with AUTH_LOCK:
         now = time.time()
-        if AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
+        if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
             return dict(AUTH_CACHE["status"])
 
-        status = detect_auth_status()
+        status = detect_auth_status(browser)
         AUTH_CACHE = {
             "saved_at": now,
             "status": dict(status),
         }
         return status
+
+
+def remember_auth(status):
+    global AUTH_CACHE
+
+    AUTH_CACHE = {
+        "saved_at": time.time(),
+        "status": dict(status),
+    }
+
+
+def auth_payload(payload):
+    return (
+        (payload.get("browser") or "").strip().lower(),
+        (payload.get("cauth") or "").strip(),
+    )
 
 
 def apply_browser_cookies(session, browser_cookies):
@@ -334,34 +538,6 @@ def apply_browser_cookies(session, browser_cookies):
         session.cookies.set(name, value, domain=domain or ".coursera.org")
 
 
-def get_coursera_user_name(cauth_cookie, browser_cookies=None):
-    session = requests.Session()
-    apply_browser_cookies(session, browser_cookies)
-    session.cookies.set("CAUTH", cauth_cookie, domain=".coursera.org")
-    endpoints = [
-        "https://api.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
-        "https://www.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
-        "https://www.coursera.org/api/userProfiles.v1?q=me&fields=fullName,name",
-        "https://www.coursera.org/api/users.v1/me?fields=fullName,name",
-        "https://www.coursera.org/api/memberships.v1?q=me&fields=name,fullName,email,emailAddress",
-    ]
-    seen_profile_ids = set()
-
-    for endpoint in endpoints:
-        name, profile_ids = get_name_from_profile_endpoint(session, endpoint)
-        if name:
-            return name
-        seen_profile_ids.update(profile_ids)
-
-    for profile_id in seen_profile_ids:
-        for endpoint in profile_endpoints_for_id(profile_id):
-            name, _ = get_name_from_profile_endpoint(session, endpoint)
-            if name:
-                return name
-
-    return get_name_from_coursera_pages(session) or get_name_from_cauth(cauth_cookie)
-
-
 def profile_endpoints_for_id(profile_id):
     encoded_id = str(profile_id).strip()
     return [
@@ -374,19 +550,25 @@ def profile_endpoints_for_id(profile_id):
 
 
 def get_name_from_profile_endpoint(session, endpoint):
+    """Look up a profile name and report the HTTP status of the lookup.
+
+    The status matters: only an explicit 401/403 means the CAUTH cookie is no
+    longer valid, while an empty result just means Coursera had no name to give.
+    """
     try:
         response = session.get(endpoint, timeout=10)
         logging.debug("Profile lookup %s returned HTTP %s.", endpoint, response.status_code)
         if response.status_code in {404, 405}:
-            return "", set()
+            return "", set(), response.status_code
         response.raise_for_status()
         data = response.json()
     except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
         logging.debug("Profile lookup failed for %s: %s", endpoint, exc)
-        return "", set()
+        return "", set(), status
     except ValueError as exc:
         logging.debug("Profile lookup returned invalid JSON for %s: %s", endpoint, exc)
-        return "", set()
+        return "", set(), None
 
     candidates = []
     if isinstance(data, dict):
@@ -407,7 +589,7 @@ def get_name_from_profile_endpoint(session, endpoint):
         logging.debug("Profile candidate keys: %s", sorted(candidate.keys()))
         name = extract_profile_name(candidate)
         if name:
-            return name, profile_ids
+            return name, profile_ids, response.status_code
         for key in ("id", "userId", "externalUserId"):
             value = candidate.get(key)
             if isinstance(value, str) and value.strip():
@@ -415,7 +597,7 @@ def get_name_from_profile_endpoint(session, endpoint):
             elif isinstance(value, int):
                 profile_ids.add(str(value))
 
-    return "", profile_ids
+    return "", profile_ids, response.status_code
 
 
 def extract_profile_name(candidate):
@@ -470,6 +652,7 @@ def get_name_from_coursera_pages(session):
         "https://www.coursera.org/account-profile",
         "https://www.coursera.org/user/edit",
     ]
+    last_status = None
     for url in urls:
         try:
             response = session.get(url, timeout=10)
@@ -477,12 +660,13 @@ def get_name_from_coursera_pages(session):
             logging.debug("Profile page lookup failed for %s: %s", url, exc)
             continue
         logging.debug("Profile page lookup %s returned HTTP %s.", url, response.status_code)
-        if response.status_code != 200:
-            continue
-        name = extract_name_from_html(response.text)
-        if name:
-            return name
-    return ""
+        if response.status_code == 200:
+            name = extract_name_from_html(response.text)
+            if name:
+                return name, response.status_code
+        elif response.status_code in {401, 403}:
+            last_status = response.status_code
+    return "", last_status
 
 
 def extract_name_from_html(markup):
@@ -648,8 +832,53 @@ def choose_download_folder(initial_path):
     return selected
 
 
+def resolve_download_auth(payload):
+    """Return (browser, cauth) for a download command.
+
+    Prefers an explicit CAUTH cookie (typed in the UI earlier in this session),
+    then the browser that already proved to be logged in, and finally the last
+    browser recorded by a successful check so the downloader can retry it.
+    """
+    browser, cauth_cookie = auth_payload(payload or {})
+    if cauth_cookie:
+        return browser or "manual", cauth_cookie
+
+    if browser and browser != "manual":
+        return browser, ""
+
+    cached = (AUTH_CACHE or {}).get("status") or {}
+    cached_browser = cached.get("browser") or ""
+    if cached.get("authenticated") and cached_browser and cached_browser != "manual":
+        return cached_browser, ""
+
+    stored = load_stored_cauth()
+    if stored:
+        return "manual", stored
+
+    raise ValueError(
+        "Coursera login was not found. Click Login, sign in to coursera.org, "
+        "then try again."
+    )
+
+
+def load_stored_cauth():
+    try:
+        return str(SimpleDB("data.bin").read("argdict").get("ca", "") or "").strip()
+    except Exception:
+        logging.debug("Could not read the saved CAUTH cookie.", exc_info=True)
+        return ""
+
+
+def save_stored_cauth(cauth_cookie):
+    try:
+        db = SimpleDB("data.bin")
+        db.upsert("argdict.ca", cauth_cookie or "")
+    except Exception:
+        logging.debug("Could not save the CAUTH cookie.", exc_info=True)
+
+
 def build_download_command(payload, resume=False, item=None):
-    detected_browser, cauth_cookie, _ = detect_cauth_cookie()
+    browser, cauth_cookie = resolve_download_auth(payload)
     course_input = payload.get("course", "").strip()
     download_path = payload.get("path", "").strip()
     resolution = payload.get("video_resolution", "720p").strip()
@@ -723,7 +952,7 @@ def build_download_command(payload, resume=False, item=None):
     if is_multi_course_program and len(class_names) > 1:
         command.append("--number-course-folders")
 
-    command[0:0] = ["--cauth", cauth_cookie]
+    command[0:0] = ["--cauth", cauth_cookie] if cauth_cookie else ["--cauth-auto", browser]
 
     if language_code == "":
         command.extend(["--ignore-formats", "srt"])
@@ -740,14 +969,13 @@ def build_download_command(payload, resume=False, item=None):
         command.extend(["--lecture_filter", re.escape(item_lecture)])
 
     return command, {
-        "browser": detected_browser,
+        "browser": browser if browser != "manual" else "",
         "argdict": {
-            "ca": "",
+            "ca": cauth_cookie if browser == "manual" else "",
             "classname": course_input,
             "path": str(download_folder),
             "video_resolution": resolution,
             "sl": language_code,
-            "ca": "",
         },
     }
 
@@ -1728,7 +1956,10 @@ def load_config():
         "languages": sorted(general.LANG_NAME_TO_CODE_MAPPING.keys()),
         "auth": {
             "mode": "auto",
-            "browsers": ["firefox", "chrome", "edge", "brave"],
+            "browsers": list(AUTH_BROWSER_ORDER),
+            # data.bin defaults "browser" to edge, so it is not a reliable
+            # record of the user's choice; the UI remembers the selection itself.
+            "has_saved_cauth": bool(str(argdict.get("ca", "") or "").strip()),
         },
         "defaults": {
             "course": argdict.get("classname", ""),
@@ -1741,8 +1972,13 @@ def load_config():
 
 def save_config(config):
     db = SimpleDB("data.bin")
-    db.upsert("browser", config["browser"])
+    if config.get("browser"):
+        db.upsert("browser", config["browser"])
     for key, value in config["argdict"].items():
+        # Never overwrite a stored CAUTH cookie with an empty string; downloads
+        # usually run against a cookie that lives in memory only.
+        if key == "ca" and not value:
+            continue
         db.upsert(f"argdict.{key}", value)
 
 
@@ -1805,7 +2041,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.open_login()
                 return
             if parsed.path == "/api/check-auth":
-                self.check_auth()
+                self.check_auth(payload)
+                return
+            if parsed.path == "/api/save-cauth":
+                self.save_cauth(payload)
                 return
             self.send_json({"error": "Not found"}, status=404)
         except ValueError as exc:
@@ -1814,11 +2053,11 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=500)
 
     def start_download(self, payload, resume, item=None):
+        command, config = build_download_command(payload, resume=resume, item=item)
         remembered_payload = dict(payload)
         if item:
             remembered_payload["item"] = dict(item)
         JOB.remember_request(remembered_payload, resume)
-        command, config = build_download_command(payload, resume=resume, item=item)
         save_config(config)
         JOB.start(command)
         self.send_json({"ok": True, "status": JOB.snapshot()})
@@ -1882,9 +2121,21 @@ class WebHandler(BaseHTTPRequestHandler):
             "message": "Coursera login opened in your browser. After logging in, click Check Auth.",
         })
 
-    def check_auth(self):
+    def check_auth(self, payload=None):
+        browser, cauth_cookie = auth_payload(payload or {})
         try:
-            status = detect_auth_status_cached()
+            # A cached result is only reused while it is positive; otherwise a
+            # sign-in that just happened in the browser would be ignored for a
+            # full minute of auth polling.
+            cached = AUTH_CACHE is not None and AUTH_CACHE["status"].get("authenticated")
+            status = detect_auth_status_cached(
+                force=not (cached and not cauth_cookie),
+                browser=browser if browser != "manual" else "",
+                cookie_value=cauth_cookie,
+            )
+            if status.get("authenticated") and cauth_cookie:
+                remember_auth(status)
+                save_stored_cauth(cauth_cookie)
             JOB.add_log(status["message"])
             self.send_json(status)
         except Exception as exc:
@@ -1892,8 +2143,21 @@ class WebHandler(BaseHTTPRequestHandler):
             logging.debug("Coursera auth check failed: %s", message)
             self.send_json({
                 "authenticated": False,
+                "user_name": "",
+                "browser": "",
                 "message": message,
             }, status=200)
+
+    def save_cauth(self, payload):
+        browser, cauth_cookie = auth_payload(payload or {})
+        if not cauth_cookie:
+            raise ValueError("Enter a CAUTH cookie value first.")
+        status = detect_auth_status_cached(force=True, browser=browser, cookie_value=cauth_cookie)
+        if status.get("authenticated"):
+            remember_auth(status)
+            save_stored_cauth(cauth_cookie)
+            JOB.add_log(status["message"])
+        self.send_json(status)
 
     def origin_is_allowed(self):
         host_header = self.headers.get("Host", "")

@@ -120,7 +120,10 @@ def create_session(args):
                 if name == 'CAUTH':
                     return cookie.get('value') if isinstance(cookie, dict) else getattr(cookie, 'value', None)
             else:
-                raise RuntimeError(f'Can not find CAUTH in {args.browser}')
+                raise RuntimeError(
+                    f'Can not find CAUTH in {args.browser}. Sign in to coursera.org '
+                    f'in {args.browser}, or pass the CAUTH cookie with --cauth.'
+                )
         cauth_cookie = autocookie(args.browser)
         logging.debug(
             f'Got CAUTH cookie from {args.browser}: "{cauth_cookie}"')

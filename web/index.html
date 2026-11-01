@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20260503-precollect-syllabus">
+    <link rel="stylesheet" href="/styles.css?v=20261101-auth">
   </head>
   <body>
     <main class="app-shell">
@@ -61,6 +61,27 @@
                   <select id="subtitle_language" name="subtitle_language"></select>
                 </div>
               </div>
+
+              <div class="field full">
+                <label for="auth_browser">Read Coursera login from</label>
+                <div class="path-row auth-row">
+                  <select id="auth_browser" name="auth_browser">
+                    <option value="">Auto-detect (Firefox, Chrome, Edge, Brave)</option>
+                    <option value="firefox">Firefox</option>
+                    <option value="chrome">Chrome</option>
+                    <option value="edge">Edge</option>
+                    <option value="brave">Brave</option>
+                  </select>
+                  <button type="button" class="secondary" id="authApplyBtn">Use this login</button>
+                </div>
+                <p class="field-hint" id="authHint">
+                  Windows blocks cookie reading from Chrome and Edge, so Firefox is the most reliable
+                  source. If auto-detect fails, paste your CAUTH cookie instead:
+                  coursera.org → F12 → Application → Cookies → https://www.coursera.org → CAUTH.
+                </p>
+                <input id="auth_cauth" name="auth_cauth" type="password" autocomplete="off"
+                       placeholder="Optional: paste CAUTH cookie value">
+              </div>
             </div>
           </section>
 
@@ -89,6 +110,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260503-no-fallback-tree"></script>
+    <script src="/app.js?v=20261101-auth"></script>
   </body>
 </html>
