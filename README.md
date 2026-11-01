@@ -117,6 +117,28 @@ The app never asks for your Coursera password. It reuses the `CAUTH` session coo
 
 A CAUTH cookie copied by hand keeps working from any browser, and it is stored locally in `data.bin` (git-ignored) so downloads keep working on the next start.
 
+### Diagnosing a login that is not detected
+
+If one profile works and another does not, run the diagnostic script in the same
+environment as the app:
+
+```bat
+conda activate coursera_env
+cd /d C:\Users\shah\Desktop\coursera\coursera-downloader
+python diagnose_cookies.py
+```
+
+It checks every browser profile separately and reports, per profile:
+
+- whether a `Local State` key file was found
+- whether rookie could open the cookie database
+- **how the `CAUTH` row is actually stored** - `plaintext`, `v10` (legacy, readable) or `v20` (app-bound, readable only by Chrome itself)
+- whether a usable `CAUTH` cookie came back
+
+That distinction is the quick way to tell "this profile really is protected by
+Chrome" apart from "something else is wrong, such as the browser holding the
+database open". Cookie values are masked in the output, so it is safe to share.
+
 # Security
 
 - Credentials are not stored; they are used only for authentication with Coursera's API.

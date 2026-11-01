@@ -58,7 +58,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261101-profiles2");
+console.info("Coursera Downloader UI loaded: 20261101-profiles3");
 
 function treeNeedsStateRender() {
   return (
@@ -1414,11 +1414,15 @@ async function applyAuthChoice() {
         authCauthInput.value = "";
       }
       showMessage(result.message, true);
-    } else if (isAuthDetectionFailure(result.message)) {
-      showMessage(authFailureMessage(result));
-      setAuthHint(authFailureMessage(result));
+      setAuthHint(result.profile_label
+        ? `Signed in via ${result.browser} profile "${result.profile_label}".`
+        : `Signed in via ${result.browser || "auto-detect"}.`);
     } else {
-      showMessage(result.message || AUTH_HINT_MESSAGE);
+      // The attempt failed, so any earlier "Signed in via ..." line is stale and
+      // contradicts the error above it. Replace it with the real reason.
+      const failure = result.message || AUTH_HINT_MESSAGE;
+      showMessage(failure);
+      setAuthHint(failure);
     }
   } catch (error) {
     showMessage(error.message);
@@ -1476,8 +1480,10 @@ async function checkAuthOnce(showResult = true) {
   const result = await authCheckPromise;
   if (!result.authenticated) {
     // "Login not detected" is an informative state, not an error: it is the
-    // normal outcome before the user signs in.
+    // normal outcome before the user signs in. Drop any stale success hint so
+    // it cannot contradict the banner.
     setAuthMessage(result.message, null, "");
+    setAuthHint(result.message);
   } else {
     setAuthMessage(result.message, true, result.user_name);
     rememberAuth(result);

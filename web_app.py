@@ -289,10 +289,24 @@ def auth_detection_error_message(details):
             "Update the app, or paste the CAUTH cookie under Settings."
         )
     if "app-bound" in text.lower() or "v20" in text.lower():
+        # Name the profile when we know it, so the user is not left guessing
+        # which of their Chrome profiles is the unreadable one.
+        labels = [label for label in PROFILE_ERRORS if PROFILE_ERRORS[label]]
+        if labels and "profile \"" in text:
+            named = ", ".join('"%s"' % label for label in labels)
+            return (
+                "Chrome protects the cookies in %s with app-bound encryption "
+                "(Chrome 127+), so no other program can read them - this is a "
+                "Chrome restriction, not a bug in the downloader. Easiest fix: "
+                "sign in at coursera.org in Firefox and pick Firefox in Settings. "
+                "Alternatively paste the CAUTH cookie under Settings."
+                % named
+            )
         return (
             "Chrome encrypted this profile's cookies with app-bound encryption, "
-            "which cannot be read by other programs. Log in with Firefox and pick "
-            "it in Settings, or paste the CAUTH cookie under Settings."
+            "which cannot be read by other programs. Sign in at coursera.org in "
+            "Firefox and pick it in Settings, or paste the CAUTH cookie under "
+            "Settings."
         )
     return (
         "Could not find a Coursera login in your browsers. If you are signed in "
@@ -303,6 +317,8 @@ def auth_detection_error_message(details):
 
 
 AUTH_PROFILE_HINTS = {}
+# Label -> reason, for profiles that could not be read during the last scan.
+PROFILE_ERRORS = {}
 CHROMIUM_BROWSERS = {"chrome", "edge", "brave"}
 FIREFOX_BROWSERS = {"firefox"}
 BROWSER_PATHS = {
@@ -543,6 +559,7 @@ def read_browser_cookies(browser, profile_path=""):
             profile_cookies = read_profile_cookies(rookiepy, browser, profile["path"])
         except Exception as exc:
             logging.debug("Could not read profile %s: %s", profile["path"], exc)
+            PROFILE_ERRORS[profile["label"]] = friendly_error_message(exc)
             continue
         added = False
         holds_cauth = False
@@ -635,6 +652,7 @@ def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=
     """
     failures = failures if failures is not None else {}
     AUTH_PROFILE_HINTS.clear()
+    PROFILE_ERRORS.clear()
     cookie_value = (cookie_value or "").strip()
     if cookie_value:
         yield "manual", cookie_value, None
@@ -665,7 +683,14 @@ def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=
             cookies = read_browser_cookies(name, profile_path or "")
         except Exception as exc:
             logging.debug("Could not read %s cookies: %s", name, exc)
-            failures[name] = friendly_error_message(exc)
+            reason = friendly_error_message(exc)
+            failures[name] = reason
+            if profile_path:
+                # A single chosen profile failed: record it under the profile's
+                # own name so the message can say which one is unreadable.
+                found = find_profile_by_path(profile_path)
+                label = found["label"] if found else Path(profile_path).parent.parent.name
+                PROFILE_ERRORS[label] = reason
             continue
 
         cauth_cookie, matched_cookie = pick_cookie_value(cookies, "CAUTH")
@@ -677,7 +702,23 @@ def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=
         failures[name] = "no CAUTH cookie for coursera.org"
 
 
-def report_auth_problem(details):
+def report_auth_problem(details, failures=None):
+    failures = failures or {}
+    # Name the profiles that failed, so "not detected" is never ambiguous when
+    # the login lives in one specific Chrome profile.
+    problems = []
+    for label, reason in PROFILE_ERRORS.items():
+        problems.append('profile "%s": %s' % (label, reason))
+    if problems:
+        summary = "; ".join(problems)
+        if not details:
+            details = summary
+        elif summary not in details:
+            details = "%s | %s" % (details, summary)
+    if not details and failures:
+        details = "; ".join(
+            "%s: %s" % (name, reason) for name, reason in sorted(failures.items())
+        )
     message = auth_detection_error_message(details)
     logging.debug("Authentication problem: %s", message)
     return {
@@ -746,7 +787,7 @@ def detect_auth_status(browser="", cookie_value="", profile_path=""):
             if name in failures:
                 details.append("%s: %s" % (name, failures[name]))
         details.append("No CAUTH cookie was found in any supported browser.")
-    return report_auth_problem("; ".join(details))
+    return report_auth_problem("; ".join(details), failures)
 
 
 def fetch_coursera_profile(cauth_cookie, browser_cookies=None):
