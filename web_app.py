@@ -282,14 +282,27 @@ def friendly_error_message(exc):
 
 def auth_detection_error_message(details):
     logging.debug("Coursera login auto-detection details: %s", details)
+    text = str(details or "")
+    if "cannot be converted to 'PyString'" in text:
+        return (
+            "This version could not read Chrome/Edge cookies on Windows. "
+            "Update the app, or paste the CAUTH cookie under Settings."
+        )
+    if "app-bound" in text.lower() or "v20" in text.lower():
+        return (
+            "Chrome encrypted this profile's cookies with app-bound encryption, "
+            "which cannot be read by other programs. Log in with Firefox and pick "
+            "it in Settings, or paste the CAUTH cookie under Settings."
+        )
     return (
-        "Could not auto-detect your Coursera login. Log in at coursera.org in "
-        "Firefox (Chrome/Edge cookies cannot be read on Windows), then click "
-        "Login again. If it still fails, paste the CAUTH cookie under Settings, "
-        "or start the app with start_web_app.bat."
+        "Could not find a Coursera login in your browsers. If you are signed in "
+        "in a Chrome profile, open Settings, click Refresh profiles and choose "
+        "that profile. Otherwise log in with Firefox, or paste the CAUTH cookie "
+        "under Settings."
     )
 
 
+AUTH_PROFILE_HINTS = {}
 CHROMIUM_BROWSERS = {"chrome", "edge", "brave"}
 FIREFOX_BROWSERS = {"firefox"}
 BROWSER_PATHS = {
@@ -327,11 +340,31 @@ def browser_platform_key():
     return "linux"
 
 
+def expand_env_path(raw_path):
+    """Expand %VAR% and $VAR/~ in a configured browser path.
+
+    os.path.expandvars only understands %VAR% on Windows, so expand it here and
+    keep the same behaviour on every platform (which also makes this testable).
+    """
+    expanded = str(raw_path)
+    for _ in range(3):
+        replaced = re.sub(
+            r"%([^%]+)%",
+            lambda match: os.environ.get(match.group(1), match.group(0)),
+            expanded,
+        )
+        replaced = os.path.expandvars(replaced)
+        if replaced == expanded:
+            break
+        expanded = replaced
+    return Path(os.path.expanduser(expanded))
+
+
 def browser_user_data_dirs(browser):
     paths = BROWSER_PATHS.get(browser_platform_key(), {}).get(browser, [])
     directories = []
     for raw_path in paths:
-        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+        expanded = expand_env_path(raw_path)
         if expanded.is_dir():
             directories.append(expanded)
     return directories
@@ -511,22 +544,70 @@ def read_browser_cookies(browser, profile_path=""):
         except Exception as exc:
             logging.debug("Could not read profile %s: %s", profile["path"], exc)
             continue
+        added = False
+        holds_cauth = False
         for cookie in profile_cookies:
             key = (cookie.get("name"), cookie.get("value"))
             if key in seen:
                 continue
             seen.add(key)
             merged.append(cookie)
+            added = True
+            if isinstance(cookie, dict) and cookie.get("name") == "CAUTH":
+                holds_cauth = True
+        # Remember which profile actually held the Coursera session, so the UI
+        # can report and store it instead of showing only the browser name.
+        if added and holds_cauth:
+            AUTH_PROFILE_HINTS[browser] = profile
     return merged
 
 
+def find_local_state(profile_path):
+    """Locate the Chrome/Edge "Local State" file that holds the cookie key."""
+    directory = Path(profile_path).resolve().parent
+    for parent in list(directory.parents)[:4]:
+        candidate = parent / "Local State"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def read_profile_cookies(rookiepy, browser, profile_path):
+    """Read coursera.org cookies from one specific browser profile.
+
+    rookie's Python bindings disagree between platforms: on Windows
+    chromium_based(key_path, db_path, domains) needs the "Local State" key file
+    as its first argument, on Unix it is chromium_based(db_path, domains).
+    Calling it with the Unix signature on Windows fails with
+    "argument 'db_path': list object cannot be converted to 'PyString'".
+    """
     cookie_file = Path(profile_path)
     if not cookie_file.is_file():
         raise RuntimeError("Cookie file not found: %s" % cookie_file)
+
     if browser in FIREFOX_BROWSERS:
         return rookiepy.firefox_based(str(cookie_file), ["coursera.org"])
-    return rookiepy.chromium_based(str(cookie_file), ["coursera.org"])
+
+    domains = ["coursera.org"]
+    if os.name == "nt":
+        local_state = find_local_state(cookie_file)
+        if local_state is not None:
+            try:
+                return rookiepy.chromium_based(str(local_state), str(cookie_file), domains)
+            except TypeError as exc:
+                logging.debug("Windows 3-argument chromium_based failed: %s", exc)
+        else:
+            logging.debug("No Local State file above %s", cookie_file)
+        # Fall through to the 2-argument form for builds that expose it.
+        try:
+            return rookiepy.chromium_based(str(cookie_file), domains)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Could not read this browser profile: %s. Pasting the CAUTH "
+                "cookie manually still works." % exc
+            ) from exc
+
+    return rookiepy.chromium_based(str(cookie_file), domains)
 
 
 def resolve_auth_profile(profile=""):
@@ -553,6 +634,7 @@ def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=
     to one browser profile (the one the user picked in Settings).
     """
     failures = failures if failures is not None else {}
+    AUTH_PROFILE_HINTS.clear()
     cookie_value = (cookie_value or "").strip()
     if cookie_value:
         yield "manual", cookie_value, None
@@ -636,13 +718,20 @@ def detect_auth_status(browser="", cookie_value="", profile_path=""):
                 message = "%s %s" % (message, warning)
         logging.debug("Authentication detected from %s.", source)
         profile_label = ""
-        if profile_path:
-            found = find_profile_by_path(profile_path)
-            profile_label = found["label"] if found else Path(profile_path).parent.name
+        resolved_profile = profile_path
+        if resolved_profile:
+            found = find_profile_by_path(resolved_profile)
+            profile_label = found["label"] if found else Path(resolved_profile).parent.name
+        else:
+            # Auto-detect may have found the cookie in a non-default profile.
+            hint = AUTH_PROFILE_HINTS.get(source)
+            if hint:
+                resolved_profile = hint["path"]
+                profile_label = hint["label"]
         return {
             "authenticated": True,
             "browser": source,
-            "profile": profile_path,
+            "profile": resolved_profile,
             "profile_label": profile_label,
             "user_name": user_name,
             "message": message,

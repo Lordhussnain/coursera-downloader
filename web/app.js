@@ -58,7 +58,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261101-profiles");
+console.info("Coursera Downloader UI loaded: 20261101-profiles2");
 
 function treeNeedsStateRender() {
   return (

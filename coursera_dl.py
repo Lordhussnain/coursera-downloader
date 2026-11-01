@@ -97,6 +97,36 @@ def get_session():
     return session
 
 
+def _read_chromium_profile(rookiepy, profile_path):
+    """Read a Chromium-based profile, coping with rookie's per-OS signature.
+
+    Windows: chromium_based(key_path, db_path, domains)
+    Unix:    chromium_based(db_path, domains)
+    """
+    domains = ['coursera.org']
+    key_path = _find_local_state(profile_path)
+    if os.name == 'nt' and key_path:
+        try:
+            return rookiepy.chromium_based(key_path, profile_path, domains)
+        except TypeError:
+            # Older/newer bindings that only expose the 2-argument form.
+            pass
+    return rookiepy.chromium_based(profile_path, domains)
+
+
+def _find_local_state(profile_path):
+    directory = os.path.dirname(os.path.abspath(profile_path))
+    for _ in range(4):
+        candidate = os.path.join(directory, 'Local State')
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    return None
+
+
 def create_session(args):
     session = get_session()
     if args.cookies_cauth:
@@ -115,10 +145,12 @@ def create_session(args):
             if profile_path:
                 # Read one specific profile instead of the browser default, so a
                 # login that lives in another Chrome/Edge profile is found.
+                # On Windows chromium_based needs the "Local State" key file
+                # first; on Unix it takes the cookie database only.
                 if browser in ('firefox', 'librewolf'):
                     cookies = rookiepy.firefox_based(profile_path, ['coursera.org'])
                 else:
-                    cookies = rookiepy.chromium_based(profile_path, ['coursera.org'])
+                    cookies = _read_chromium_profile(rookiepy, profile_path)
                 for cookie in cookies:
                     name = cookie.get('name') if isinstance(cookie, dict) else getattr(cookie, 'name', None)
                     if name == 'CAUTH':
