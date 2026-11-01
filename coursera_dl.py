@@ -111,6 +111,23 @@ def create_session(args):
                     "python -m pip install -r requirements.txt, then retry."
                 ) from exc
 
+            profile_path = getattr(args, 'cookies_cauth_profile', None)
+            if profile_path:
+                # Read one specific profile instead of the browser default, so a
+                # login that lives in another Chrome/Edge profile is found.
+                if browser in ('firefox', 'librewolf'):
+                    cookies = rookiepy.firefox_based(profile_path, ['coursera.org'])
+                else:
+                    cookies = rookiepy.chromium_based(profile_path, ['coursera.org'])
+                for cookie in cookies:
+                    name = cookie.get('name') if isinstance(cookie, dict) else getattr(cookie, 'name', None)
+                    if name == 'CAUTH':
+                        return cookie.get('value') if isinstance(cookie, dict) else getattr(cookie, 'value', None)
+                raise RuntimeError(
+                    f'Can not find CAUTH in the chosen {browser} profile. '
+                    f'Open that profile, sign in to coursera.org, and retry.'
+                )
+
             cookie_loader = getattr(rookiepy, browser, None)
             if cookie_loader is None:
                 raise RuntimeError(f'Invalid browser {args.browser}')

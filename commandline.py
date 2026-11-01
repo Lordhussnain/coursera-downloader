@@ -372,6 +372,13 @@ def parse_args(args=None):
         help='Load CAUTH cookie from browser')
 
     group_adv_auth.add_argument(
+        '--cauth-profile',
+        dest='cookies_cauth_profile',
+        action='store',
+        default=None,
+        help='path to a specific browser profile cookie database to read CAUTH from')
+
+    group_adv_auth.add_argument(
         '-c',
         '--cookies_file',
         dest='cookies_file',
@@ -508,6 +515,10 @@ def parse_args(args=None):
 
     if args.cookies_file and not os.path.exists(args.cookies_file):
         logging.error('Cookies file not found: %s', args.cookies_file)
+        sys.exit(1)
+
+    if args.cookies_cauth_profile and not args.browser:
+        logging.error('--cauth-profile must be used together with --cauth-auto BROWSER')
         sys.exit(1)
 
     if not args.cookies_file and not args.cookies_cauth and not args.browser:

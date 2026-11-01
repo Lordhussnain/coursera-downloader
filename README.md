@@ -83,8 +83,8 @@ start_web_app.bat
 
 The app never asks for your Coursera password. It reuses the `CAUTH` session cookie from a browser you are already signed in to.
 
-- **Firefox is the most reliable source.** Windows protects Chrome and Edge cookies with *app-bound encryption* (Chrome 127+, current Edge). No external program - including this app, even when run as administrator - can read those cookies. When only Chrome/Edge is signed in, auto-detection fails.
-- Choose the browser under **Settings -> Read Coursera login from**, then click **Use this login**.
+- **Pick the right browser profile.** Chrome, Edge and Brave keep each profile (`Default`, `Profile 1`, ...) in its own folder with its own cookie database. The old build only ever read `Default`, so a login made in a profile named e.g. "Shah" was invisible. Now the app scans every profile, and **Settings -> Browser profile with your Coursera login** lets you point it at the exact one (use **Refresh profiles** after creating a profile or signing in), then click **Use this login**.
+- **Firefox is the most reliable source.** Windows protects Chrome and Edge cookies with *app-bound encryption* (Chrome 127+, current Edge). No external program - including this app, even when run as administrator - can read those cookies. Selecting the profile helps when the profile is readable; if it reports that the cookies are encrypted, use Firefox or paste the cookie.
 - If auto-detection still fails (Chrome/Edge only, or a locked cookie database), paste the cookie manually:
   1. Sign in at `https://www.coursera.org` in any browser.
   2. Press `F12` -> **Application** -> **Cookies** -> `https://www.coursera.org`.

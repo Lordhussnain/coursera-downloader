@@ -242,11 +242,21 @@ def redact_command(command):
 def friendly_error_message(exc):
     message = str(exc)
     lowered = message.lower()
-    if "appbound encryption" in lowered or "app-bound" in lowered:
+    # rookie reports app-bound encryption (Chrome 127+ / current Edge) as a bare
+    # "decrypt_encrypted_value failed", so match that too, not only the wording
+    # used by other cookie libraries.
+    decrypt_failed = "decrypt_encrypted_value failed" in lowered
+    if "appbound encryption" in lowered or "app-bound" in lowered or decrypt_failed:
+        if os.name == "nt":
+            return (
+                "Chrome/Edge protects this profile's cookies with Windows app-bound "
+                "encryption, so they cannot be read by another program. Sign in to "
+                "Coursera in Firefox, or paste the CAUTH cookie manually."
+            )
         return (
-            "Chrome/Edge protects its cookies with Windows app-bound encryption, "
-            "so the login cannot be read from that browser. Use another browser "
-            "for Coursera (Firefox works), or paste the CAUTH cookie manually."
+            "This browser profile protects its cookies with encryption that cannot "
+            "be read here. Sign in to Coursera in Firefox, or paste the CAUTH "
+            "cookie manually."
         )
     if "can't find cookies file" in lowered or "cannot find cookies file" in lowered:
         return (
@@ -280,6 +290,146 @@ def auth_detection_error_message(details):
     )
 
 
+CHROMIUM_BROWSERS = {"chrome", "edge", "brave"}
+FIREFOX_BROWSERS = {"firefox"}
+BROWSER_PATHS = {
+    "win32": {
+        "chrome": ["%LOCALAPPDATA%\\Google\\Chrome\\User Data"],
+        "edge": ["%LOCALAPPDATA%\\Microsoft\\Edge\\User Data"],
+        "brave": ["%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data"],
+        "firefox": ["%APPDATA%\\Mozilla\\Firefox"],
+    },
+    "darwin": {
+        "chrome": ["~/Library/Application Support/Google/Chrome"],
+        "edge": ["~/Library/Application Support/Microsoft Edge"],
+        "brave": ["~/Library/Application Support/BraveSoftware/Brave-Browser"],
+        "firefox": ["~/Library/Application Support/Firefox"],
+    },
+    "linux": {
+        "chrome": ["~/.config/google-chrome", "~/.config/google-chrome-beta"],
+        "edge": ["~/.config/microsoft-edge"],
+        "brave": ["~/.config/BraveSoftware/Brave-Browser"],
+        "firefox": ["~/.mozilla/firefox"],
+    },
+}
+PROFILE_COOKIE_FILES = {
+    "chromium": [Path("Network") / "Cookies", Path("Cookies")],
+    "firefox": [Path("cookies.sqlite")],
+}
+DEFAULT_CHROMIUM_PROFILE = "Default"
+
+
+def browser_platform_key():
+    if os.name == "nt":
+        return "win32"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
+def browser_user_data_dirs(browser):
+    paths = BROWSER_PATHS.get(browser_platform_key(), {}).get(browser, [])
+    directories = []
+    for raw_path in paths:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+        if expanded.is_dir():
+            directories.append(expanded)
+    return directories
+
+
+def find_profile_cookie_file(profile_dir, browser):
+    """Return the cookie database inside a browser profile folder, if any."""
+    candidates = PROFILE_COOKIE_FILES["firefox" if browser in FIREFOX_BROWSERS else "chromium"]
+    for relative in candidates:
+        candidate = Path(profile_dir) / relative
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_profile_display_name(profile_dir):
+    """Read the human readable profile name shown by Chrome/Edge/Brave."""
+    prefs_path = Path(profile_dir) / "Preferences"
+    try:
+        data = json.loads(prefs_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return ""
+    profile = data.get("profile") if isinstance(data, dict) else None
+    if not isinstance(profile, dict):
+        return ""
+    for key in ("name", "gaia_name", "local_profile_name"):
+        value = profile.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def describe_browser_profile(profile_dir, browser):
+    """Return (label, email, is_default) for a profile folder."""
+    label = read_profile_display_name(profile_dir) or Path(profile_dir).name
+    email = ""
+    if browser in CHROMIUM_BROWSERS:
+        try:
+            info = json.loads(
+                (Path(profile_dir) / "Signed In Profile").read_text(encoding="utf-8", errors="replace")
+            )
+            if isinstance(info, dict):
+                account = info.get("account_info")
+                if isinstance(account, list) and account and isinstance(account[0], dict):
+                    email = str(account[0].get("email") or "")
+        except (OSError, ValueError):
+            pass
+    return label, email, Path(profile_dir).name == DEFAULT_CHROMIUM_PROFILE
+
+
+def list_browser_profiles(browser):
+    """List the profiles of `browser` that have a readable cookie database."""
+    profiles = []
+    seen = set()
+    for user_data_dir in browser_user_data_dirs(browser):
+        if browser in FIREFOX_BROWSERS:
+            profile_dirs = [entry for entry in user_data_dir.iterdir() if entry.is_dir()]
+        else:
+            profile_dirs = [user_data_dir / DEFAULT_CHROMIUM_PROFILE]
+            profile_dirs.extend(
+                sorted(
+                    entry
+                    for entry in user_data_dir.iterdir()
+                    if entry.is_dir() and (entry.name == "Profile" or entry.name.startswith("Profile "))
+                )
+            )
+
+        for profile_dir in profile_dirs:
+            if not profile_dir.is_dir() or profile_dir in seen:
+                continue
+            seen.add(profile_dir)
+            cookie_file = find_profile_cookie_file(profile_dir, browser)
+            if cookie_file is None:
+                continue
+            label, email, is_default = describe_browser_profile(profile_dir, browser)
+            profiles.append({
+                "browser": browser,
+                "path": str(cookie_file),
+                "profile_dir": str(profile_dir),
+                "folder": profile_dir.name,
+                "label": label,
+                "email": email,
+                "is_default": is_default,
+            })
+
+    profiles.sort(key=lambda item: (not item["is_default"], item["path"].lower()))
+    return profiles
+
+
+def find_profile_by_path(path):
+    target = str(Path(path))
+    for browser in AUTH_BROWSER_ORDER:
+        for profile in list_browser_profiles(browser):
+            if profile["path"] == target or profile["profile_dir"] == target:
+                return profile
+    return None
+
+
 def normalize_cookie_domain(domain):
     return str(domain or "").strip().lstrip(".").lower()
 
@@ -310,7 +460,13 @@ def pick_cookie_value(cookies, name):
     return matches[0][2], matches[0][1]
 
 
-def read_browser_cookies(browser):
+def read_browser_cookies(browser, profile_path=""):
+    """Read coursera.org cookies from a browser, or from one specific profile.
+
+    rookiepy's per-browser helpers only read the default profile folder, so a
+    login that lives in another Chrome/Edge profile is invisible to them. When a
+    profile cookie database path is given, the generic readers are used instead.
+    """
     try:
         import rookiepy
     except ModuleNotFoundError as exc:
@@ -319,18 +475,82 @@ def read_browser_cookies(browser):
             "python -m pip install -r requirements.txt, then restart the app."
         ) from exc
 
+    if profile_path:
+        return read_profile_cookies(rookiepy, browser, profile_path)
+
     cookie_loader = getattr(rookiepy, browser, None)
     if cookie_loader is None:
         raise RuntimeError("Unsupported browser: %s" % browser)
 
-    return cookie_loader(["coursera.org"])
+    # The browser helper only looks at the default profile, and it raises if that
+    # profile does not exist. Never let that hide the profiles we can list, which
+    # is exactly the situation of a user who only uses a named Chrome profile.
+    try:
+        cookies = cookie_loader(["coursera.org"])
+        default_error = None
+    except Exception as exc:
+        cookies = []
+        default_error = exc
+
+    extra_profiles = [
+        profile for profile in list_browser_profiles(browser)
+        if not profile["is_default"]
+    ]
+
+    if default_error is not None and not extra_profiles:
+        raise default_error
+
+    if not extra_profiles:
+        return cookies
+
+    merged = list(cookies)
+    seen = {(cookie.get("name"), cookie.get("value")) for cookie in cookies if isinstance(cookie, dict)}
+    for profile in extra_profiles:
+        try:
+            profile_cookies = read_profile_cookies(rookiepy, browser, profile["path"])
+        except Exception as exc:
+            logging.debug("Could not read profile %s: %s", profile["path"], exc)
+            continue
+        for cookie in profile_cookies:
+            key = (cookie.get("name"), cookie.get("value"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cookie)
+    return merged
 
 
-def iter_cauth_sources(browser="", cookie_value="", failures=None):
+def read_profile_cookies(rookiepy, browser, profile_path):
+    cookie_file = Path(profile_path)
+    if not cookie_file.is_file():
+        raise RuntimeError("Cookie file not found: %s" % cookie_file)
+    if browser in FIREFOX_BROWSERS:
+        return rookiepy.firefox_based(str(cookie_file), ["coursera.org"])
+    return rookiepy.chromium_based(str(cookie_file), ["coursera.org"])
+
+
+def resolve_auth_profile(profile=""):
+    """Return (browser, cookie file path) for a profile chosen by the user."""
+    profile = (profile or "").strip()
+    if not profile:
+        return "", ""
+    found = find_profile_by_path(profile)
+    if found:
+        return found["browser"], found["path"]
+    # A raw cookie database path that is no longer listed (profile renamed).
+    if Path(profile).is_file():
+        return "", profile
+    raise ValueError(
+        "That browser profile no longer exists. Open Settings and pick it again."
+    )
+
+
+def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=""):
     """Yield (source, cauth_cookie, cookies) for each possible login source.
 
     `failures` is an optional dict that receives a human readable reason per
-    browser that could not provide a cookie.
+    browser that could not provide a cookie. `profile_path` restricts the scan
+    to one browser profile (the one the user picked in Settings).
     """
     failures = failures if failures is not None else {}
     cookie_value = (cookie_value or "").strip()
@@ -339,16 +559,28 @@ def iter_cauth_sources(browser="", cookie_value="", failures=None):
         return
 
     browser = (browser or "").strip().lower()
-    browser_order = [browser] if browser else []
-    for name in AUTH_BROWSER_ORDER:
-        if name not in browser_order:
-            browser_order.append(name)
+    if profile_path:
+        # A chosen profile means: read that exact cookie database and nothing
+        # else. Resolve its browser so the right reader (chromium vs firefox)
+        # is used, and never fall back to scanning every browser afterwards.
+        if not browser:
+            found = find_profile_by_path(profile_path)
+            if found:
+                browser = found["browser"]
+        if not browser:
+            raise ValueError("Could not tell which browser that profile belongs to.")
+        browser_order = [browser]
+    else:
+        browser_order = [browser] if browser else []
+        for name in AUTH_BROWSER_ORDER:
+            if name not in browser_order:
+                browser_order.append(name)
 
     for name in browser_order:
         if name not in general.ALLOWED_BROWSERS:
             continue
         try:
-            cookies = read_browser_cookies(name)
+            cookies = read_browser_cookies(name, profile_path or "")
         except Exception as exc:
             logging.debug("Could not read %s cookies: %s", name, exc)
             failures[name] = friendly_error_message(exc)
@@ -369,6 +601,8 @@ def report_auth_problem(details):
     return {
         "authenticated": False,
         "browser": "",
+        "profile": "",
+        "profile_label": "",
         "user_name": "",
         "message": message,
         "warning": "",
@@ -376,11 +610,11 @@ def report_auth_problem(details):
     }
 
 
-def detect_auth_status(browser="", cookie_value=""):
+def detect_auth_status(browser="", cookie_value="", profile_path=""):
     details = []
     failures = {}
     candidates = 0
-    for source, cauth_cookie, cookies in iter_cauth_sources(browser, cookie_value, failures):
+    for source, cauth_cookie, cookies in iter_cauth_sources(browser, cookie_value, failures, profile_path):
         candidates += 1
         profile = fetch_coursera_profile(cauth_cookie, cookies)
         if not profile.get("verified"):
@@ -401,9 +635,15 @@ def detect_auth_status(browser="", cookie_value=""):
             else:
                 message = "%s %s" % (message, warning)
         logging.debug("Authentication detected from %s.", source)
+        profile_label = ""
+        if profile_path:
+            found = find_profile_by_path(profile_path)
+            profile_label = found["label"] if found else Path(profile_path).parent.name
         return {
             "authenticated": True,
             "browser": source,
+            "profile": profile_path,
+            "profile_label": profile_label,
             "user_name": user_name,
             "message": message,
             "warning": warning,
@@ -486,11 +726,11 @@ def get_name_from_profile_id(session, profile_id):
     return ""
 
 
-def detect_auth_status_cached(force=False, browser="", cookie_value=""):
+def detect_auth_status_cached(force=False, browser="", cookie_value="", profile_path=""):
     global AUTH_CACHE
 
     if cookie_value:
-        return detect_auth_status(browser, cookie_value)
+        return detect_auth_status(browser, cookie_value, profile_path)
 
     now = time.time()
     if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
@@ -501,7 +741,7 @@ def detect_auth_status_cached(force=False, browser="", cookie_value=""):
         if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
             return dict(AUTH_CACHE["status"])
 
-        status = detect_auth_status(browser)
+        status = detect_auth_status(browser, profile_path=profile_path)
         AUTH_CACHE = {
             "saved_at": now,
             "status": dict(status),
@@ -523,6 +763,10 @@ def auth_payload(payload):
         (payload.get("browser") or "").strip().lower(),
         (payload.get("cauth") or "").strip(),
     )
+
+
+def auth_profile_from_payload(payload):
+    return str((payload or {}).get("profile") or "").strip()
 
 
 def apply_browser_cookies(session, browser_cookies):
@@ -833,27 +1077,36 @@ def choose_download_folder(initial_path):
 
 
 def resolve_download_auth(payload):
-    """Return (browser, cauth) for a download command.
+    """Return {browser, cauth, profile} describing how to authenticate.
 
-    Prefers an explicit CAUTH cookie (typed in the UI earlier in this session),
-    then the browser that already proved to be logged in, and finally the last
-    browser recorded by a successful check so the downloader can retry it.
+    Prefers an explicit CAUTH cookie (typed in the UI), then the browser profile
+    the user picked, then whatever the last successful login check found, and
+    finally a previously saved CAUTH cookie.
     """
     browser, cauth_cookie = auth_payload(payload or {})
     if cauth_cookie:
-        return browser or "manual", cauth_cookie
+        return {"browser": browser or "manual", "cauth": cauth_cookie, "profile": ""}
+
+    profile_path = auth_profile_from_payload(payload)
+    if profile_path:
+        profile_browser, cookie_file = resolve_auth_profile(profile_path)
+        return {"browser": profile_browser, "cauth": "", "profile": cookie_file}
 
     if browser and browser != "manual":
-        return browser, ""
+        return {"browser": browser, "cauth": "", "profile": ""}
 
     cached = (AUTH_CACHE or {}).get("status") or {}
     cached_browser = cached.get("browser") or ""
+    cached_profile = cached.get("profile") or ""
+    if cached.get("authenticated") and cached_profile:
+        profile_browser, cookie_file = resolve_auth_profile(cached_profile)
+        return {"browser": profile_browser, "cauth": "", "profile": cookie_file}
     if cached.get("authenticated") and cached_browser and cached_browser != "manual":
-        return cached_browser, ""
+        return {"browser": cached_browser, "cauth": "", "profile": ""}
 
     stored = load_stored_cauth()
     if stored:
-        return "manual", stored
+        return {"browser": "manual", "cauth": stored, "profile": ""}
 
     raise ValueError(
         "Coursera login was not found. Click Login, sign in to coursera.org, "
@@ -869,6 +1122,21 @@ def load_stored_cauth():
         return ""
 
 
+def load_stored_profile():
+    try:
+        return str(SimpleDB("data.bin").read("auth_profile") or "").strip()
+    except Exception:
+        logging.debug("Could not read the saved browser profile.", exc_info=True)
+        return ""
+
+
+def save_stored_profile(profile_path):
+    try:
+        SimpleDB("data.bin").upsert("auth_profile", profile_path or "")
+    except Exception:
+        logging.debug("Could not save the browser profile.", exc_info=True)
+
+
 def save_stored_cauth(cauth_cookie):
     try:
         db = SimpleDB("data.bin")
@@ -878,7 +1146,8 @@ def save_stored_cauth(cauth_cookie):
 
 
 def build_download_command(payload, resume=False, item=None):
-    browser, cauth_cookie = resolve_download_auth(payload)
+    auth = resolve_download_auth(payload)
+    browser = auth["browser"]
     course_input = payload.get("course", "").strip()
     download_path = payload.get("path", "").strip()
     resolution = payload.get("video_resolution", "720p").strip()
@@ -952,7 +1221,12 @@ def build_download_command(payload, resume=False, item=None):
     if is_multi_course_program and len(class_names) > 1:
         command.append("--number-course-folders")
 
-    command[0:0] = ["--cauth", cauth_cookie] if cauth_cookie else ["--cauth-auto", browser]
+    if auth["profile"]:
+        command[0:0] = ["--cauth-auto", browser, "--cauth-profile", auth["profile"]]
+    elif auth["cauth"]:
+        command[0:0] = ["--cauth", auth["cauth"]]
+    else:
+        command[0:0] = ["--cauth-auto", browser]
 
     if language_code == "":
         command.extend(["--ignore-formats", "srt"])
@@ -971,7 +1245,7 @@ def build_download_command(payload, resume=False, item=None):
     return command, {
         "browser": browser if browser != "manual" else "",
         "argdict": {
-            "ca": cauth_cookie if browser == "manual" else "",
+            "ca": auth["cauth"] if browser == "manual" else "",
             "classname": course_input,
             "path": str(download_folder),
             "video_resolution": resolution,
@@ -1960,6 +2234,7 @@ def load_config():
             # data.bin defaults "browser" to edge, so it is not a reliable
             # record of the user's choice; the UI remembers the selection itself.
             "has_saved_cauth": bool(str(argdict.get("ca", "") or "").strip()),
+            "saved_profile": load_stored_profile(),
         },
         "defaults": {
             "course": argdict.get("classname", ""),
@@ -2046,6 +2321,9 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/save-cauth":
                 self.save_cauth(payload)
                 return
+            if parsed.path == "/api/browser-profiles":
+                self.list_profiles()
+                return
             self.send_json({"error": "Not found"}, status=404)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
@@ -2122,16 +2400,26 @@ class WebHandler(BaseHTTPRequestHandler):
         })
 
     def check_auth(self, payload=None):
-        browser, cauth_cookie = auth_payload(payload or {})
+        payload = payload or {}
+        browser, cauth_cookie = auth_payload(payload)
+        profile_path = auth_profile_from_payload(payload)
         try:
-            # A cached result is only reused while it is positive; otherwise a
-            # sign-in that just happened in the browser would be ignored for a
-            # full minute of auth polling.
-            cached = AUTH_CACHE is not None and AUTH_CACHE["status"].get("authenticated")
+            # A cached result is only reused while it is positive and describes
+            # the same login source; otherwise a sign-in that just happened in
+            # the browser would be ignored for a full minute of auth polling.
+            cached_status = (AUTH_CACHE or {}).get("status") or {}
+            cached = bool(cached_status.get("authenticated"))
+            # Key the cache on the exact login source so switching browser or
+            # profile is never answered from a stale positive result.
+            same_source = (
+                (cached_status.get("profile") or "") == profile_path
+                and (cached_status.get("browser") or "") == (browser or "")
+            )
             status = detect_auth_status_cached(
-                force=not (cached and not cauth_cookie),
+                force=not (cached and same_source and not cauth_cookie),
                 browser=browser if browser != "manual" else "",
                 cookie_value=cauth_cookie,
+                profile_path=profile_path,
             )
             if status.get("authenticated") and cauth_cookie:
                 remember_auth(status)
@@ -2149,15 +2437,34 @@ class WebHandler(BaseHTTPRequestHandler):
             }, status=200)
 
     def save_cauth(self, payload):
-        browser, cauth_cookie = auth_payload(payload or {})
-        if not cauth_cookie:
-            raise ValueError("Enter a CAUTH cookie value first.")
-        status = detect_auth_status_cached(force=True, browser=browser, cookie_value=cauth_cookie)
+        payload = payload or {}
+        browser, cauth_cookie = auth_payload(payload)
+        profile_path = auth_profile_from_payload(payload)
+        if not cauth_cookie and not profile_path and not browser:
+            raise ValueError("Choose a browser profile or paste a CAUTH cookie first.")
+        status = detect_auth_status_cached(
+            force=True,
+            browser=browser if browser != "manual" else "",
+            cookie_value=cauth_cookie,
+            profile_path=profile_path,
+        )
         if status.get("authenticated"):
             remember_auth(status)
-            save_stored_cauth(cauth_cookie)
+            if cauth_cookie:
+                save_stored_cauth(cauth_cookie)
+            if profile_path:
+                save_stored_profile(profile_path)
             JOB.add_log(status["message"])
         self.send_json(status)
+
+    def list_profiles(self):
+        profiles = []
+        for browser in AUTH_BROWSER_ORDER:
+            try:
+                profiles.extend(list_browser_profiles(browser))
+            except Exception:
+                logging.debug("Could not list %s profiles.", browser, exc_info=True)
+        self.send_json({"profiles": profiles, "selected": load_stored_profile()})
 
     def origin_is_allowed(self):
         host_header = self.headers.get("Host", "")

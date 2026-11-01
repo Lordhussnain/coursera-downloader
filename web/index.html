@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261101-auth">
+    <link rel="stylesheet" href="/styles.css?v=20261101-profiles">
   </head>
   <body>
     <main class="app-shell">
@@ -63,24 +63,34 @@
               </div>
 
               <div class="field full">
-                <label for="auth_browser">Read Coursera login from</label>
+                <label for="auth_profile">Browser profile with your Coursera login</label>
                 <div class="path-row auth-row">
-                  <select id="auth_browser" name="auth_browser">
-                    <option value="">Auto-detect (Firefox, Chrome, Edge, Brave)</option>
+                  <select id="auth_profile" name="auth_profile">
+                    <option value="">Auto-detect all browser profiles</option>
+                  </select>
+                  <button type="button" class="secondary" id="authApplyBtn">Use this login</button>
+                </div>
+                <p class="field-hint" id="authHint">
+                  Chrome keeps every profile (for example "Shah" and "Your Chrome") in its own folder,
+                  so pick the profile where you are signed in to Coursera.
+                </p>
+                <div class="path-row auth-row">
+                  <select id="auth_browser" name="auth_browser" aria-label="Browser to read the login from">
+                    <option value="">Any browser</option>
                     <option value="firefox">Firefox</option>
                     <option value="chrome">Chrome</option>
                     <option value="edge">Edge</option>
                     <option value="brave">Brave</option>
                   </select>
-                  <button type="button" class="secondary" id="authApplyBtn">Use this login</button>
+                  <button type="button" class="secondary" id="authRefreshBtn">Refresh profiles</button>
                 </div>
-                <p class="field-hint" id="authHint">
-                  Windows blocks cookie reading from Chrome and Edge, so Firefox is the most reliable
-                  source. If auto-detect fails, paste your CAUTH cookie instead:
+                <input id="auth_cauth" name="auth_cauth" type="password" autocomplete="off"
+                       placeholder="Or paste a CAUTH cookie value">
+                <p class="field-hint">
+                  Chrome and Edge on Windows block cookie reading (app-bound encryption) unless the
+                  profile is readable. If detection still fails, copy the cookie manually:
                   coursera.org → F12 → Application → Cookies → https://www.coursera.org → CAUTH.
                 </p>
-                <input id="auth_cauth" name="auth_cauth" type="password" autocomplete="off"
-                       placeholder="Optional: paste CAUTH cookie value">
               </div>
             </div>
           </section>
@@ -110,6 +120,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261101-auth"></script>
+    <script src="/app.js?v=20261101-profiles"></script>
   </body>
 </html>

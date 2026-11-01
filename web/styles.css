@@ -382,6 +382,12 @@ select:focus {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
+/* The profile dropdown holds long labels like "Shah · email (Chrome, Profile 1)". */
+#auth_profile {
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

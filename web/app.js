@@ -21,6 +21,8 @@ const courseClearBtn = document.querySelector("#courseClearBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
 const authBrowserSelect = document.querySelector("#auth_browser");
+const authProfileSelect = document.querySelector("#auth_profile");
+const authRefreshBtn = document.querySelector("#authRefreshBtn");
 const authCauthInput = document.querySelector("#auth_cauth");
 const authApplyBtn = document.querySelector("#authApplyBtn");
 const authHint = document.querySelector("#authHint");
@@ -48,6 +50,7 @@ let downloadStatePromise = null;
 const expandedTreeIds = new Set();
 
 const AUTH_BROWSER_STORAGE_KEY = "courseraDownloader.authBrowser";
+const AUTH_PROFILE_STORAGE_KEY = "courseraDownloader.authProfile";
 const AUTH_HINT_MESSAGE =
   "Login not detected yet. Sign in to coursera.org in the same browser, then click Login again. " +
   "Chrome and Edge cookies are protected on Windows, so Firefox is the most reliable choice. " +
@@ -55,7 +58,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261101-auth");
+console.info("Coursera Downloader UI loaded: 20261101-profiles");
 
 function treeNeedsStateRender() {
   return (
@@ -387,11 +390,64 @@ function setAuthHint(text) {
 
 function authPayload(extra = {}) {
   const selected = authBrowserSelect ? authBrowserSelect.value.trim() : "";
+  const profile = authProfileSelect ? authProfileSelect.value : "";
   const cauth = authCauthInput ? authCauthInput.value.trim() : "";
   if (cauth) {
     return { ...extra, browser: "manual", cauth };
   }
+  if (profile) {
+    return { ...extra, browser: "", profile };
+  }
   return { ...extra, browser: selected };
+}
+
+function profileOptionLabel(profile) {
+  const label = profile.label || profile.folder;
+  const email = String(profile.email || "").trim();
+  const browserName = profile.browser.charAt(0).toUpperCase() + profile.browser.slice(1);
+  const details = [browserName];
+  if (profile.folder && profile.folder !== label) details.push(profile.folder);
+  const name = email && !label.toLowerCase().includes(email.toLowerCase()) ? `${label} · ${email}` : label;
+  return `${name} (${details.join(", ")})`;
+}
+
+async function loadBrowserProfiles(config) {
+  if (!authProfileSelect) return;
+  const savedProfile = (config && config.auth && config.auth.saved_profile) || "";
+  const remembered = localStorage.getItem(AUTH_PROFILE_STORAGE_KEY) || savedProfile;
+  let profiles = [];
+  try {
+    const data = await requestJson("/api/browser-profiles", { method: "POST", body: "{}" });
+    profiles = data.profiles || [];
+  } catch (error) {
+    console.debug("Could not list browser profiles", error);
+  }
+
+  authProfileSelect.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = profiles.length
+    ? "Auto-detect all browser profiles"
+    : "Auto-detect (no readable browser profiles found)";
+  authProfileSelect.append(auto);
+
+  profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.path;
+    option.textContent = profileOptionLabel(profile);
+    authProfileSelect.append(option);
+  });
+
+  if (remembered && profiles.some((profile) => profile.path === remembered)) {
+    authProfileSelect.value = remembered;
+  } else if (remembered && !profiles.length) {
+    // Keep the choice visible even if the profile list is unavailable right now.
+    const option = document.createElement("option");
+    option.value = remembered;
+    option.textContent = "Saved profile";
+    authProfileSelect.append(option);
+    authProfileSelect.value = remembered;
+  }
 }
 
 function isAuthDetectionFailure(message) {
@@ -1349,7 +1405,9 @@ async function applyAuthChoice() {
     setAuthMessage(result.message, result.authenticated, result.user_name);
     if (result.authenticated) {
       rememberAuth(result);
-      if (payload.browser && payload.browser !== "manual") {
+      if (payload.profile) {
+        localStorage.setItem(AUTH_PROFILE_STORAGE_KEY, payload.profile);
+      } else if (payload.browser && payload.browser !== "manual") {
         localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, payload.browser);
       }
       if (payload.cauth && authCauthInput) {
@@ -1396,6 +1454,7 @@ async function init() {
   }
 
   restoreAuthBrowser(config);
+  await loadBrowserProfiles(config);
   const initialDownloadState = updateDownloadState({ force: true, render: true });
   await refreshStatus();
   await initialDownloadState;
@@ -1422,7 +1481,12 @@ async function checkAuthOnce(showResult = true) {
   } else {
     setAuthMessage(result.message, true, result.user_name);
     rememberAuth(result);
-    setAuthHint(`Signed in via ${result.browser === "manual" ? "the saved CAUTH cookie" : result.browser || "auto-detect"}.`);
+    const sourceLabel = result.browser === "manual"
+      ? "the saved CAUTH cookie"
+      : result.profile_label
+        ? `${result.browser} profile "${result.profile_label}"`
+        : result.browser || "auto-detect";
+    setAuthHint(`Signed in via ${sourceLabel}.`);
   }
   if (showResult && !result.authenticated) {
     if (isAuthDetectionFailure(result.message)) {
@@ -1734,6 +1798,24 @@ if (authApplyBtn) {
 if (authBrowserSelect) {
   authBrowserSelect.addEventListener("change", () => {
     localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, authBrowserSelect.value);
+  });
+}
+
+if (authProfileSelect) {
+  authProfileSelect.addEventListener("change", () => {
+    localStorage.setItem(AUTH_PROFILE_STORAGE_KEY, authProfileSelect.value);
+  });
+}
+
+if (authRefreshBtn) {
+  authRefreshBtn.addEventListener("click", async () => {
+    authRefreshBtn.disabled = true;
+    try {
+      await loadBrowserProfiles(null);
+      showMessage("Browser profiles refreshed.", true);
+    } finally {
+      authRefreshBtn.disabled = false;
+    }
   });
 }
 
