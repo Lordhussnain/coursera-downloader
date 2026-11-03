@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261103-retry">
+    <link rel="stylesheet" href="/styles.css?v=20261103-queue">
     <script>
       // Applied before the body renders so a dark-theme user never sees a
       // white flash while the stylesheet loads.
@@ -140,6 +140,18 @@
 
         <section class="message" id="message" hidden></section>
 
+        <section class="download-queue" id="downloadQueue" hidden>
+          <div class="queue-head">
+            <strong id="queueTitle">Queue</strong>
+            <div class="queue-actions">
+              <button type="button" class="secondary small" id="clearQueueBtn"
+                      title="Remove every course from the queue">Clear queue</button>
+            </div>
+          </div>
+          <p class="queue-current" id="queueCurrent" hidden></p>
+          <ul class="queue-list" id="queueList"></ul>
+        </section>
+
         <section class="job-progress" id="jobProgress" hidden>
           <div class="job-progress-head">
             <span class="job-progress-label" id="jobProgressLabel">Downloading</span>
@@ -214,6 +226,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261103-retry"></script>
+    <script src="/app.js?v=20261103-queue"></script>
   </body>
 </html>

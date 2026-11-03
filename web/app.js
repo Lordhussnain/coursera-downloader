@@ -23,6 +23,11 @@ const settingsPanel = document.querySelector("#settingsPanel");
 const expandTreeBtn = document.querySelector("#expandTreeBtn");
 const collapseTreeBtn = document.querySelector("#collapseTreeBtn");
 const courseClearBtn = document.querySelector("#courseClearBtn");
+const downloadQueue = document.querySelector("#downloadQueue");
+const queueList = document.querySelector("#queueList");
+const queueTitle = document.querySelector("#queueTitle");
+const queueCurrent = document.querySelector("#queueCurrent");
+const clearQueueBtn = document.querySelector("#clearQueueBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
 const authBrowserSelect = document.querySelector("#auth_browser");
@@ -90,7 +95,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261103-retry");
+console.info("Coursera Downloader UI loaded: 20261103-queue");
 
 // Restore log view preferences. Reading them here (not at first poll) means the
 // filter is already correct when the first lines arrive.
@@ -400,21 +405,29 @@ function refreshDownloadButton() {
   const canceling = state === "canceling";
 
   const completed = isCurrentCourseCompleted();
+
+  // The submit button is never a pause button. It used to turn into "Pause"
+  // while a download ran, which is why pasting a second link paused the first
+  // instead of queueing it. Pausing is what the dedicated Pause button is for.
   downloadBtn.disabled = canceling;
-  downloadBtn.textContent = canceling
-    ? "Canceling"
+  downloadBtn.textContent = running
+    ? "Add to queue"
     : paused
       ? "Resume"
-      : running
-        ? "Pause"
-        : completed
-          ? "Preview"
-          : canResumeCurrentCourse
-            ? "Resume"
-            : "Download";
+      : completed
+        ? "Preview"
+        : canResumeCurrentCourse
+          ? "Resume"
+          : "Download";
   downloadBtn.classList.toggle("preview-mode", !running && !canceling && completed);
+  downloadBtn.classList.toggle("queue-mode", running && !canceling);
+  downloadBtn.title = running
+    ? "Download this course after the current one finishes"
+    : "";
 
-  pauseBtn.hidden = true;
+  // Pause/Resume becomes a real, visible control while a job is running.
+  pauseBtn.hidden = !running || canceling;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
   cancelBtn.hidden = !running;
   cancelBtn.disabled = canceling;
 }
@@ -817,7 +830,60 @@ function notifyJobFinished(status) {
   }
 }
 
+function renderQueue(status) {
+  if (!downloadQueue) return;
+  const queue = Array.isArray(status.queue) ? status.queue : [];
+  const runningCourse = status.current_course || "";
+  const show = queue.length > 0 || Boolean(runningCourse);
+  downloadQueue.hidden = !show;
+  if (!show) {
+    queueList.innerHTML = "";
+    return;
+  }
+  if (queueTitle) {
+    queueTitle.textContent = queue.length
+      ? `Queue (${queue.length} waiting)`
+      : "Queue";
+  }
+  if (queueCurrent) {
+    queueCurrent.hidden = !runningCourse;
+    queueCurrent.textContent = runningCourse ? `Downloading now: ${runningCourse}` : "";
+  }
+  queueList.innerHTML = queue
+    .map((entry, index) => {
+      const label = escapeHtml(queueCourseLabel(entry));
+      const sub = escapeHtml(entry.path || "");
+      const upDisabled = index === 0 ? " disabled" : "";
+      const downDisabled = index === queue.length - 1 ? " disabled" : "";
+      return `
+        <li class="queue-item" data-entry-id="${entry.id}">
+          <span class="queue-index">${index + 1}</span>
+          <span class="queue-text">
+            <span class="queue-name">${label}</span>
+            <span class="queue-path" title="${sub}">${sub}</span>
+          </span>
+          <span class="queue-item-actions">
+            <button type="button" class="secondary small queue-up" title="Move up"${upDisabled}>↑</button>
+            <button type="button" class="secondary small queue-down" title="Move down"${downDisabled}>↓</button>
+            <button type="button" class="secondary small queue-remove" title="Remove from queue">×</button>
+          </span>
+        </li>`;
+    })
+    .join("");
+  if (clearQueueBtn) clearQueueBtn.hidden = queue.length === 0;
+}
+
 function renderStatus(status) {
+  // Each queued run restarts the server's log numbering at 1. Without clearing
+  // the cursor here the second course's lines would all look "already seen"
+  // and the log pane would silently stay empty for the rest of the queue.
+  const previousJobSeq = currentStatus ? currentStatus.job_seq : undefined;
+  if (typeof status.job_seq === "number" && typeof previousJobSeq === "number" && status.job_seq !== previousJobSeq) {
+    logEntries = [];
+    logCursor = 0;
+    logHiddenBefore = 0;
+    notifiedJobEnd = false;
+  }
   currentStatus = status;
   const state = status.status || "idle";
   jobState.textContent = state.charAt(0).toUpperCase() + state.slice(1);
@@ -839,6 +905,7 @@ function renderStatus(status) {
 
   renderProgress(status);
   renderFailedFiles(status);
+  renderQueue(status);
   updateDeleteButton();
 
   // Reset the latch as soon as a new job starts so each run notifies once.
@@ -1605,6 +1672,55 @@ function requestNotificationPermission() {
   }
 }
 
+function queueCourseLabel(entry) {
+  return entry.class_name || entry.course || "Course";
+}
+
+async function enqueueCurrentCourse() {
+  const payload = authPayload(payloadFromForm());
+  if (!String(payload.course || "").trim()) {
+    showMessage("Paste a course URL first.");
+    return;
+  }
+  const endpoint = canResumeCurrentCourse ? "/api/queue-resume" : "/api/queue";
+  const result = await requestJson(endpoint, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  renderStatus(result.status);
+  showMessage("Added to the queue. It starts automatically when the current download finishes.", true);
+  hideRecentCoursesLanding();
+  // Only the input is cleared. The tree and log still belong to the course that
+  // is downloading right now, so they must not be reset here.
+  courseInput.value = "";
+  localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  updateClearButtonVisibility();
+  hideCourseHistory();
+}
+
+async function removeQueueEntry(entryId) {
+  const result = await requestJson("/api/queue-remove", {
+    method: "POST",
+    body: JSON.stringify({ entry_id: entryId }),
+  });
+  renderStatus(result.status);
+  showMessage("Removed from the queue.", true);
+}
+
+async function moveQueueEntry(entryId, offset) {
+  const result = await requestJson("/api/queue-move", {
+    method: "POST",
+    body: JSON.stringify({ entry_id: entryId, offset }),
+  });
+  renderStatus(result.status);
+}
+
+async function clearQueue() {
+  const result = await requestJson("/api/queue-clear", { method: "POST", body: "{}" });
+  renderStatus(result.status);
+  showMessage("Queue cleared.", true);
+}
+
 async function startDownload(endpoint) {
   clearMessage();
   userChangedExpansion = false;
@@ -1866,12 +1982,10 @@ form.addEventListener("submit", async (event) => {
   addToCourseHistory(courseInput.value);
   hideCourseHistory();
   try {
+    // While a course is downloading, a pasted link joins the queue - it does
+    // not pause the current download and it is not rejected.
     if (currentStatus.running) {
-      const paused = currentStatus.status === "paused";
-      await controlDownload(
-        paused ? "/api/resume-job" : "/api/pause",
-        paused ? "Download resumed." : "Download paused."
-      );
+      await enqueueCurrentCourse();
       return;
     }
 
@@ -1991,6 +2105,51 @@ document.addEventListener("click", (event) => {
     return;
   }
 });
+
+if (pauseBtn) {
+  pauseBtn.addEventListener("click", async () => {
+    const paused = currentStatus && currentStatus.status === "paused";
+    try {
+      await controlDownload(
+        paused ? "/api/resume-job" : "/api/pause",
+        paused ? "Download resumed." : "Download paused."
+      );
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (clearQueueBtn) {
+  clearQueueBtn.addEventListener("click", async () => {
+    try {
+      await clearQueue();
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (queueList) {
+  queueList.addEventListener("click", async (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    const item = button.closest(".queue-item");
+    if (!item) return;
+    const entryId = Number(item.dataset.entryId);
+    try {
+      if (button.classList.contains("queue-remove")) {
+        await removeQueueEntry(entryId);
+      } else if (button.classList.contains("queue-up")) {
+        await moveQueueEntry(entryId, -1);
+      } else if (button.classList.contains("queue-down")) {
+        await moveQueueEntry(entryId, 1);
+      }
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
 
 refreshBtn.addEventListener("click", async () => {
   try {

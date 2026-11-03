@@ -167,6 +167,17 @@ class DownloadJob:
         self.last_resume = False
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
+        # Queue of courses waiting for the current download to finish. Entries
+        # are prepared (command already built, so the URL was valid) but not
+        # started. One job runs at a time; this is what makes pasting a second
+        # link while the first is downloading an "add to queue" instead of a
+        # "start failed".
+        self.queue = []
+        self.queue_seq = 0
+        # Increments every time a job starts. The UI uses it to detect that the
+        # log belongs to a new run: log_seq restarts at 1, so without this the
+        # second course's log lines would be filtered out as "already seen".
+        self.job_seq = 0
 
     def add_log(self, message):
         with self.lock:
@@ -216,7 +227,81 @@ class DownloadJob:
                 "progress": current_progress(),
                 "failed_files": failed_files(),
                 "retrying_files": retrying_files(),
+                "job_seq": self.job_seq,
+                "queue": [dict(entry) for entry in self.queue],
+                "current_course": self._current_course_locked(),
             }
+
+    def _current_course_locked(self):
+        """The course of the running job, for labelling the active item."""
+        if not self.running or not self.last_payload:
+            return ""
+        return self.last_payload.get("course", "").strip()
+
+    def queue_snapshot(self):
+        with self.lock:
+            return [dict(entry) for entry in self.queue]
+
+    def enqueue(self, payload, command, resume):
+        """Prepare a job to run after the current one.
+
+        The command is built up front so an invalid URL is rejected while the
+        user is still looking at the form, not silently an hour later when the
+        queue reaches it. Everything needed to start it is stored here, so a
+        queued course does not depend on the form still saying what it said.
+        """
+        course = str(payload.get("course", "")).strip()
+        with self.lock:
+            if any(entry.get("payload", {}).get("course", "").strip() == course for entry in self.queue):
+                raise ValueError("That course is already in the queue.")
+            if self.running and self._current_course_locked() == course:
+                raise ValueError("That course is already downloading.")
+            self.queue_seq += 1
+            entry = {
+                "id": self.queue_seq,
+                "course": course,
+                "class_name": str(payload.get("_class_name", "")),
+                "path": str(payload.get("path", "")).strip(),
+                "resume": bool(resume),
+                "added_at": time.time(),
+                "payload": dict(payload),
+                "command": list(command),
+            }
+            self.queue.append(entry)
+        self.add_log("Queued: %s" % (entry["class_name"] or course))
+        return dict(entry)
+
+    def dequeue(self, entry_id):
+        with self.lock:
+            for index, entry in enumerate(self.queue):
+                if entry.get("id") == entry_id:
+                    del self.queue[index]
+                    return True
+            return False
+
+    def clear_queue(self):
+        with self.lock:
+            count = len(self.queue)
+            self.queue = []
+        return count
+
+    def move_in_queue(self, entry_id, offset):
+        """Move a queued item up (-1) or down (+1). Returns True if it moved."""
+        with self.lock:
+            ids = [entry.get("id") for entry in self.queue]
+            if entry_id not in ids:
+                return False
+            index = ids.index(entry_id)
+            target = index + offset
+            if target < 0 or target >= len(self.queue):
+                return False
+            self.queue[index], self.queue[target] = self.queue[target], self.queue[index]
+            return True
+
+    def _pop_next_queued_locked(self):
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
 
     def remember_request(self, payload, resume):
         with self.lock:
@@ -265,16 +350,33 @@ class DownloadJob:
             last_path = self.last_payload.get("path", "").strip()
         return last_course == course_input and Path(last_path).expanduser() == Path(download_path).expanduser()
 
-    def start(self, command):
+    def start_or_queue(self, payload, command, resume):
+        """Run now if idle, otherwise add to the queue.
+
+        Returns ("started", None) or ("queued", entry). This is the behaviour a
+        user expects when pasting a second link while a course downloads.
+        """
+        with self.lock:
+            busy = self.running
+        if busy:
+            return "queued", self.enqueue(payload, command, resume)
+        self.start(command, payload=payload, resume=resume)
+        return "started", None
+
+    def start(self, command, payload=None, resume=False):
         with self.lock:
             if self.running:
                 raise RuntimeError("A download is already running.")
+            if payload is not None:
+                self.last_payload = dict(payload)
+                self.last_resume = bool(resume)
             self.running = True
             self.status = "running"
             self.error = ""
             self.command = list(command)
             self.logs = []
             self.log_seq = 0
+            self.job_seq += 1
             self.started_at = time.time()
             self.finished_at = None
             self.cancel_event.clear()
@@ -311,12 +413,52 @@ class DownloadJob:
         self.add_log("Cancel requested.")
 
     def _run(self, command):
+        """Run jobs back to back: the requested one, then anything queued."""
+        pending = list(command)
+        while True:
+            outcome = self._run_one(pending)
+            with self.lock:
+                entry = self._pop_next_queued_locked() if outcome == "ok" else None
+                if entry is None:
+                    self.running = False
+                    self.pause_event.clear()
+                    self.cancel_event.clear()
+                    self.finished_at = time.time()
+                    return
+                # Claim the next job while still holding the lock, so a cancel
+                # arriving now cannot leave `running` False with a live thread.
+                self.status = "running"
+                self.error = ""
+                pending = list(entry.get("command") or [])
+                self.command = list(pending)
+                self.logs = []
+                self.log_seq = 0
+                self.job_seq += 1
+                self.started_at = time.time()
+                self.finished_at = None
+                self.cancel_event.clear()
+                self.pause_event.clear()
+                self.last_payload = dict(entry.get("payload") or {})
+                self.last_resume = bool(entry.get("resume"))
+                label = entry.get("class_name") or entry.get("course", "")
+            # Logged outside the lock: add_log() takes it, and threading.Lock is
+            # not reentrant, so calling it under the lock above would deadlock.
+            self.add_log("Queue: starting %s" % label)
+
+    def _run_one(self, command):
+        """Execute a single command. Returns "ok" when the queue may advance.
+
+        A cancelled or failed job stops the queue: the next course would very
+        likely hit the same problem, and silently burning through a queue of
+        courses after a failure is worse than stopping so the user can look.
+        """
         handler = JobLogHandler(self)
         root_logger = logging.getLogger()
         root_logger.addHandler(handler)
         set_download_control_events(self.cancel_event, self.pause_event)
         reset_progress()
         reset_file_status()
+        outcome = "ok"
         try:
             self.add_log("Resume started." if "--resume" in command else "Download started.")
             main_f(command)
@@ -325,11 +467,13 @@ class DownloadJob:
                 self.status = "canceled"
                 self.error = ""
             self.add_log("Download canceled.")
+            outcome = "stop"
         except Exception as exc:
             with self.lock:
                 self.status = "failed"
                 self.error = friendly_error_message(exc)
             self.add_log(traceback.format_exc())
+            outcome = "stop"
         else:
             with self.lock:
                 self.status = "completed"
@@ -338,12 +482,7 @@ class DownloadJob:
             set_download_control_events(None, None)
             root_logger.removeHandler(handler)
             reset_progress()
-            with self.lock:
-                self.running = False
-                self.pause_event.clear()
-                self.cancel_event.clear()
-                self.finished_at = time.time()
-
+        return outcome
 
 JOB = DownloadJob()
 AUTH_LOCK = threading.Lock()
@@ -2680,6 +2819,21 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/resume":
                 self.start_download(payload, resume=True)
                 return
+            if parsed.path == "/api/queue":
+                self.queue_download(payload, resume=False)
+                return
+            if parsed.path == "/api/queue-resume":
+                self.queue_download(payload, resume=True)
+                return
+            if parsed.path == "/api/queue-remove":
+                self.queue_remove(payload)
+                return
+            if parsed.path == "/api/queue-clear":
+                self.queue_clear()
+                return
+            if parsed.path == "/api/queue-move":
+                self.queue_move(payload)
+                return
             if parsed.path == "/api/retry":
                 self.retry_download()
                 return
@@ -2739,9 +2893,46 @@ class WebHandler(BaseHTTPRequestHandler):
         remembered_payload = dict(payload)
         if item:
             remembered_payload["item"] = dict(item)
-        JOB.remember_request(remembered_payload, resume)
         save_config(config)
-        JOB.start(command)
+        if item:
+            # Per-item retries always target the running/previous course; they
+            # are never queued, because they are a repair of an existing job.
+            JOB.remember_request(remembered_payload, resume)
+            JOB.start(command, payload=remembered_payload, resume=resume)
+            self.send_json({"ok": True, "status": JOB.snapshot()})
+            return
+        outcome, entry = JOB.start_or_queue(remembered_payload, command, resume)
+        self.send_json({
+            "ok": True,
+            "queued": outcome == "queued",
+            "entry_id": (entry or {}).get("id"),
+            "status": JOB.snapshot(),
+        })
+
+    def queue_download(self, payload, resume):
+        """Explicitly add a course to the queue, even while one is running."""
+        command, config = build_download_command(payload, resume=resume, item=None)
+        save_config(config)
+        entry = JOB.enqueue(dict(payload), command, resume)
+        self.send_json({"ok": True, "queued": True, "entry_id": entry["id"], "status": JOB.snapshot()})
+
+    def queue_remove(self, payload):
+        entry_id = payload.get("entry_id")
+        if not JOB.dequeue(entry_id):
+            raise ValueError("That item is no longer in the queue.")
+        self.send_json({"ok": True, "status": JOB.snapshot()})
+
+    def queue_clear(self):
+        removed = JOB.clear_queue()
+        self.send_json({"ok": True, "removed": removed, "status": JOB.snapshot()})
+
+    def queue_move(self, payload):
+        entry_id = payload.get("entry_id")
+        offset = int(payload.get("offset", 0))
+        if offset not in (-1, 1):
+            raise ValueError("Move offset must be -1 or 1.")
+        if not JOB.move_in_queue(entry_id, offset):
+            raise ValueError("That item cannot move any further.")
         self.send_json({"ok": True, "status": JOB.snapshot()})
 
     def retry_download(self):
@@ -2786,8 +2977,14 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "status": JOB.snapshot()})
 
     def cancel_download(self):
-        JOB.cancel()
-        self.send_json({"ok": True, "status": JOB.snapshot()})
+        try:
+            JOB.cancel()
+        except RuntimeError:
+            pass
+        # Cancelling the run also drops the queue: leaving courses queued behind
+        # a cancelled download would start them the moment the user pressed stop.
+        removed = JOB.clear_queue()
+        self.send_json({"ok": True, "queue_cleared": removed, "status": JOB.snapshot()})
 
     def course_delete_info(self, payload):
         """Report what a delete would remove, so the UI can ask before acting."""

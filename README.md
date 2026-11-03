@@ -139,6 +139,26 @@ Notes:
 3. Click **Login**, sign in to Coursera in the browser window that opens, then click **Login** again.
 4. Select and download courses.
 
+## Queueing several courses
+
+Paste a course URL and press **Download**. While that course is downloading the
+button reads **Add to queue**: paste the next URL and press it again. Repeat for
+as many courses as you like - they download one after another, automatically,
+with no need to wait and no need to press anything between them.
+
+- The **Queue** panel lists what is waiting, in order, and names the course
+  downloading right now.
+- Each row has **↑**, **↓** and **×** to reorder or remove it.
+- **Clear queue** drops everything waiting; the current course keeps downloading.
+- **Pause** / **Resume** on their own button control the running download. They
+  are no longer attached to the Download button, so adding to the queue can
+  never pause what is running.
+- **Cancel** stops the current course *and* clears the queue, so nothing starts
+  behind your back after you press stop.
+- If a course fails (bad URL, expired login), the queue stops there instead of
+  working through the rest, so one broken link cannot silently burn the whole
+  list. The failure is shown and the remaining courses stay queued.
+
 ## Login / authentication
 
 The app never asks for your Coursera password. It reuses the `CAUTH` session cookie from a browser you are already signed in to.

@@ -1,5 +1,21 @@
 # Changelog
 
+## v3.8.0
+- **Course queue.** Pasting a second URL while a course downloads now adds it to
+  the queue instead of failing. Queued courses start on their own, in order, as
+  each one finishes.
+- The Download button no longer turns into a Pause button while a job runs. That
+  made a pasted link pause the running download instead of queueing it - the bug
+  behind "I cannot add another link". Pause/Resume now lives on its own button.
+- New Queue panel: lists waiting courses, names the active one, and allows
+  reordering (up/down), removing, and clearing.
+- Cancel clears the queue; a failed course stops the queue rather than running
+  through the rest.
+- Each queued run gets a clean log. Previously the second job's log lines were
+  hidden because the server restarts log numbering at 1 and the UI cursor had
+  already advanced past it.
+- README: "Queueing several courses" section.
+
 ## v3.7.1
 - `start_web_app.bat` now only accepts Python **3.8 - 3.12**. A newer Python on
   `PATH` (3.13/3.14/3.15) is skipped instead of being chosen, so an Anaconda
