@@ -10,6 +10,75 @@
   --danger: #b42318;
   --success: #087443;
   --shadow: 0 18px 45px rgba(27, 39, 63, 0.12);
+
+  /* Surfaces used by panels, rows and inputs. Declaring them here means the
+     dark theme below only has to override colours, not every rule. */
+  --surface-muted: #f8fafc;
+  --surface-sunken: #eef1f6;
+  --surface-hover: #f0f2f6;
+  --input-bg: #ffffff;
+  --code-bg: #f8fafc;
+  --border: #d7dce2;
+  --text-muted: #5b6672;
+  --text-soft: #475569;
+  --text-strong: #0f172a;
+
+  /* Status colours */
+  --info-bg: #edf4ff;
+  --info-border: #c7dbff;
+  --info-text: #12457f;
+  --warn-bg: #fff7ed;
+  --warn-border: #fed7aa;
+  --warn-text: #9a3412;
+  --error-bg: #fff1ef;
+  --error-border: #f0b8b2;
+  --error-text: #b91c1c;
+  --ok-bg: #edf9f3;
+  --ok-border: #b8dfcc;
+  --ok-text: #047857;
+  --row-alt: #f8fafc;
+  --overlay: rgba(15, 23, 42, 0.45);
+}
+
+/* Dark theme. Applied via data-theme="dark" on <html>, so switching is instant
+   and needs no reload. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f141c;
+  --surface: #161d27;
+  --text: #e6ebf2;
+  --muted: #9aa7b8;
+  --line: #2a3441;
+  --accent: #4f92ff;
+  --accent-strong: #77adff;
+  --danger: #ff7b72;
+  --success: #4ade80;
+  --shadow: 0 18px 45px rgba(0, 0, 0, 0.5);
+
+  --surface-muted: #1b2431;
+  --surface-sunken: #131a24;
+  --surface-hover: #222d3b;
+  --input-bg: #111823;
+  --code-bg: #131a24;
+  --border: #2a3441;
+  --text-muted: #9aa7b8;
+  --text-soft: #b6c2d2;
+  --text-strong: #f1f5fb;
+
+  --info-bg: #12243d;
+  --info-border: #1f3f66;
+  --info-text: #9cc4ff;
+  --warn-bg: #2b1f10;
+  --warn-border: #4a3418;
+  --warn-text: #f2c078;
+  --error-bg: #2d1414;
+  --error-border: #4d2222;
+  --error-text: #ff9a92;
+  --ok-bg: #10261b;
+  --ok-border: #1d4530;
+  --ok-text: #6ee7a8;
+  --row-alt: #131a24;
+  --overlay: rgba(0, 0, 0, 0.6);
 }
 
 * {
@@ -131,41 +200,41 @@ h2 {
   padding: 5px 10px;
   text-align: center;
   color: var(--muted);
-  background: #f5f7fb;
+  background: var(--surface-sunken);
   font-size: 13px;
   font-weight: 700;
   line-height: 1.2;
 }
 
 .status-pill.running {
-  border-color: #b9cff5;
+  border-color: var(--info-border);
   color: var(--accent-strong);
-  background: #edf4ff;
+  background: var(--info-bg);
 }
 
 .status-pill.paused {
-  border-color: #f2d189;
-  color: #8a5a00;
-  background: #fff8e8;
+  border-color: var(--warn-border);
+  color: var(--warn-text);
+  background: var(--warn-bg);
 }
 
 .status-pill.canceling,
 .status-pill.canceled {
-  border-color: #f0b8b2;
+  border-color: var(--error-border);
   color: var(--danger);
-  background: #fff1ef;
+  background: var(--error-bg);
 }
 
 .status-pill.completed {
-  border-color: #b8dfcc;
+  border-color: var(--ok-border);
   color: var(--success);
-  background: #edf9f3;
+  background: var(--ok-bg);
 }
 
 .status-pill.failed {
-  border-color: #f0b8b2;
+  border-color: var(--error-border);
   color: var(--danger);
-  background: #fff1ef;
+  background: var(--error-bg);
 }
 
 .download-form {
@@ -199,8 +268,8 @@ h2 {
   height: 22px;
   border-radius: 50%;
   border: 0;
-  background: #e2e8f0;
-  color: #475569;
+  background: var(--surface-sunken);
+  color: var(--text-soft);
   font-size: 16px;
   line-height: 1;
   display: inline-flex;
@@ -212,8 +281,8 @@ h2 {
 }
 
 .course-clear:hover {
-  background: #cbd5e1;
-  color: #0f172a;
+  background: var(--border);
+  color: var(--text-strong);
 }
 
 .course-clear[hidden] {
@@ -229,7 +298,7 @@ h2 {
   margin: 0;
   padding: 4px;
   list-style: none;
-  background: #ffffff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
@@ -250,7 +319,7 @@ h2 {
 }
 
 .course-history-item:hover {
-  background: #f1f5f9;
+  background: var(--surface-hover);
 }
 
 .course-history-pick {
@@ -261,7 +330,7 @@ h2 {
   padding: 8px 10px;
   cursor: pointer;
   font: inherit;
-  color: #0f172a;
+  color: var(--text-strong);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -281,8 +350,8 @@ h2 {
 }
 
 .course-history-remove:hover {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: var(--error-bg);
+  color: var(--error-text);
 }
 
 .course-history-pagination {
@@ -300,7 +369,7 @@ h2 {
 .course-history-pagination button {
   appearance: none;
   border: 1px solid var(--line);
-  background: #ffffff;
+  background: var(--surface);
   border-radius: 6px;
   padding: 4px 10px;
   font-size: 12px;
@@ -339,7 +408,7 @@ h2 {
 }
 
 label {
-  color: #374151;
+  color: var(--text-soft);
   font-size: 14px;
   font-weight: 600;
 }
@@ -358,14 +427,34 @@ select {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 9px 11px;
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
 }
 
 input[type="text"]:focus,
+input[type="password"]:focus,
 select:focus {
   border-color: var(--accent);
   outline: 3px solid rgba(20, 102, 216, 0.16);
+}
+
+.field-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* The "Use this login" button sizes itself instead of using the 104px column
+   of the folder picker rows. */
+.auth-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+/* The profile dropdown holds long labels like "Shah · email (Chrome, Profile 1)". */
+#auth_profile {
+  min-width: 0;
+  text-overflow: ellipsis;
 }
 
 .segmented {
@@ -395,7 +484,7 @@ select:focus {
 }
 
 .segmented label:has(input:checked) {
-  background: #edf4ff;
+  background: var(--info-bg);
   color: var(--accent-strong);
 }
 
@@ -414,6 +503,25 @@ select:focus {
   padding: 0;
 }
 
+.icon-toggle {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+/* Sun in light mode (click to go dark), moon in dark mode. */
+.icon-toggle::before {
+  content: "\1F319";
+  font-size: 17px;
+  line-height: 1;
+}
+
+:root[data-theme="dark"] .icon-toggle::before {
+  content: "\2600";
+}
+
 .settings-toggle::before {
   content: "\2699";
   font-size: 20px;
@@ -421,9 +529,9 @@ select:focus {
 }
 
 .settings-toggle.active {
-  border-color: #b9cff5;
+  border-color: var(--info-border);
   color: var(--accent-strong);
-  background: #edf4ff;
+  background: var(--info-bg);
 }
 
 .settings-panel {
@@ -440,7 +548,7 @@ select:focus {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px;
-  background: #fbfcff;
+  background: var(--surface-muted);
   display: grid;
   gap: 12px;
 }
@@ -466,7 +574,7 @@ button:disabled {
 
 button[type="submit"] {
   background: var(--accent);
-  color: #fff;
+  color: var(--surface);
 }
 
 button[type="submit"]:hover {
@@ -474,11 +582,11 @@ button[type="submit"]:hover {
 }
 
 button[type="submit"].preview-mode {
-  background: #047857;
+  background: var(--ok-text);
 }
 
 button[type="submit"].preview-mode:hover {
-  background: #065f46;
+  background: var(--accent-strong);
 }
 
 .recent-courses {
@@ -529,7 +637,7 @@ button[type="submit"].preview-mode:hover {
   padding: 8px 30px 8px 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--surface);
   cursor: pointer;
   text-align: left;
   font: inherit;
@@ -549,7 +657,7 @@ button[type="submit"].preview-mode:hover {
 
 .recent-course-title {
   font-weight: 600;
-  color: #0f172a;
+  color: var(--text-strong);
   font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -583,46 +691,46 @@ button[type="submit"].preview-mode:hover {
 }
 
 .recent-course-remove:hover {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: var(--error-bg);
+  color: var(--error-text);
 }
 
 .secondary,
 .icon-button {
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
   border-color: var(--line);
 }
 
 .secondary.danger {
   color: var(--danger);
-  border-color: #f0b8b2;
+  border-color: var(--error-border);
 }
 
 button.ok {
-  border-color: #b8dfcc;
+  border-color: var(--ok-border);
   color: var(--success);
-  background: #edf9f3;
+  background: var(--ok-bg);
 }
 
 button.bad {
-  border-color: #f0b8b2;
+  border-color: var(--error-border);
   color: var(--danger);
-  background: #fff1ef;
+  background: var(--error-bg);
 }
 
 .message {
   margin-top: 16px;
   border-radius: 6px;
   padding: 11px 12px;
-  background: #fff7ed;
-  border: 1px solid #fed7aa;
-  color: #9a3412;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
 }
 
 .message.ok {
-  background: #edf9f3;
-  border-color: #b8dfcc;
+  background: var(--ok-bg);
+  border-color: var(--ok-border);
   color: var(--success);
 }
 
@@ -631,18 +739,18 @@ button.bad {
   grid-template-columns: 72px minmax(0, 1fr);
   gap: 12px;
   align-items: start;
-  border: 1px solid #fed7aa;
+  border: 1px solid var(--warn-border);
   border-radius: 6px;
   padding: 10px 12px;
   margin-bottom: 10px;
-  color: #9a3412;
-  background: #fff7ed;
+  color: var(--warn-text);
+  background: var(--warn-bg);
 }
 
 .log-status.ok {
-  border-color: #b8dfcc;
+  border-color: var(--ok-border);
   color: var(--success);
-  background: #edf9f3;
+  background: var(--ok-bg);
 }
 
 .log-status span {
@@ -675,7 +783,7 @@ button.bad {
   margin: 0;
   overflow: auto;
   min-height: 0;
-  color: #111827;
+  color: var(--text);
   font-size: 13px;
   line-height: 1.45;
 }
@@ -684,19 +792,32 @@ button.bad {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   border-right: 1px solid var(--line);
-  background: #f8fafc;
+  background: var(--surface-muted);
 }
 
 .tree-toolbar {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
   padding: 12px 18px 8px;
   border-bottom: 1px solid var(--line);
 }
 
+/* Sits first in the toolbar and stays visually distinct: it is navigation, not
+   a tool that acts on the course. */
+.back-button {
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.back-button[hidden] {
+  display: none !important;
+}
+
 .activity-tree {
   padding: 10px 18px 18px;
-  background: #f8fafc;
+  background: var(--surface-muted);
 }
 
 .activity-log {
@@ -739,27 +860,27 @@ button.bad {
 
 .tree-status-badge.completed,
 .tree-status-badge.downloaded {
-  background: #d1fae5;
-  color: #047857;
+  background: var(--ok-bg);
+  color: var(--ok-text);
 }
 
 .tree-status-badge.partial {
-  background: #fef3c7;
-  color: #b45309;
+  background: var(--warn-bg);
+  color: var(--warn-text);
 }
 
 .tree-status-badge.missing,
 .tree-status-badge.manifest-missing,
 .tree-status-badge.failed {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: var(--error-bg);
+  color: var(--error-text);
 }
 
 .tree-status-badge.manifest,
 .tree-status-badge.pending,
 .tree-status-badge.running {
-  background: #e0e7ff;
-  color: #4338ca;
+  background: var(--info-bg);
+  color: var(--accent-strong);
   font-style: italic;
 }
 
@@ -772,7 +893,7 @@ button.bad {
 }
 
 .tree-node.folder {
-  color: #374151;
+  color: var(--text-soft);
 }
 
 .tree-node .tree-label {
@@ -798,7 +919,7 @@ button.bad {
 
 .tree-module {
   padding-left: 20px;
-  color: #374151;
+  color: var(--text-soft);
   font-weight: 600;
 }
 
@@ -812,7 +933,7 @@ button.bad {
 .tree-module.active,
 .tree-section.active,
 .tree-node.active {
-  background: #edf4ff;
+  background: var(--info-bg);
   color: var(--accent-strong);
 }
 
@@ -821,7 +942,7 @@ button.bad {
   border: 1px solid var(--line);
   border-radius: 8px;
   margin-bottom: 12px;
-  background: #fff;
+  background: var(--surface);
   overflow: hidden;
 }
 
@@ -837,7 +958,7 @@ button.bad {
 .activity-course-head,
 .folder-detail-head {
   padding: 10px 12px;
-  background: #f4f7fb;
+  background: var(--surface-muted);
   border-bottom: 1px solid var(--line);
 }
 
@@ -862,7 +983,7 @@ button.bad {
 .activity-actions button {
   min-height: 26px;
   border-color: var(--line);
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
   padding: 3px 8px;
   font-size: 12px;
@@ -880,7 +1001,7 @@ button.bad {
 
 .progress {
   height: 4px;
-  background: #e8edf5;
+  background: var(--surface-sunken);
 }
 
 .progress i {
@@ -896,11 +1017,11 @@ button.bad {
 .activity-note {
   padding: 8px 12px;
   color: var(--muted);
-  border-bottom: 1px solid #eef1f6;
+  border-bottom: 1px solid var(--surface-sunken);
 }
 
 .activity-module {
-  border-bottom: 1px solid #eef1f6;
+  border-bottom: 1px solid var(--surface-sunken);
 }
 
 .activity-module:last-child {
@@ -929,7 +1050,7 @@ button.bad {
   gap: 8px;
   align-items: center;
   padding: 5px 0;
-  border-top: 1px solid #f0f2f6;
+  border-top: 1px solid var(--surface-hover);
 }
 
 .folder-detail > .activity-item,
@@ -947,7 +1068,7 @@ button.bad {
   width: 100%;
   min-height: 0;
   border: 0;
-  border-top: 1px solid #f0f2f6;
+  border-top: 1px solid var(--surface-hover);
   border-radius: 0;
   background: transparent;
   padding: 8px 0;
@@ -991,40 +1112,40 @@ button.bad {
 }
 
 .activity-item em.downloaded {
-  color: #047857;
+  color: var(--ok-text);
 }
 
 .activity-item em.partial {
-  color: #b45309;
+  color: var(--warn-text);
 }
 
 .activity-item em.missing {
-  color: #b91c1c;
+  color: var(--error-text);
 }
 
 .activity-item em.not-downloadable {
-  color: #475569;
+  color: var(--text-soft);
   font-weight: 500;
 }
 
 .activity-item em.pending {
-  color: #6b7280;
+  color: var(--text-muted);
   font-style: italic;
 }
 
 .activity-item.non-downloadable {
-  background: #f8fafc;
-  border-left: 3px solid #94a3b8;
+  background: var(--surface-muted);
+  border-left: 3px solid var(--text-muted);
   padding-left: 9px;
 }
 
 .activity-item.non-downloadable span {
-  color: #475569;
+  color: var(--text-soft);
   font-weight: 600;
 }
 
 .activity-item.non-downloadable p {
-  color: #475569;
+  color: var(--text-soft);
 }
 
 .activity-item p {
@@ -1054,7 +1175,7 @@ button.bad {
 }
 
 .activity-item.note p {
-  color: #8a4b0f;
+  color: var(--warn-text);
 }
 
 @media (max-width: 900px) {
@@ -1098,4 +1219,354 @@ button.bad {
   .title-row {
     flex-wrap: wrap;
   }
+}
+
+/* ---------- Live job progress ---------- */
+.job-progress {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.job-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.job-progress-label {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.job-progress-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  color: var(--text-muted, var(--text-muted));
+}
+
+.job-progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.09);
+  overflow: hidden;
+}
+
+.job-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  transition: width 0.25s ease;
+}
+
+/* Indeterminate state: we know it is working but not how much is left. */
+.job-progress-track.indeterminate .job-progress-fill {
+  width: 35% !important;
+  animation: job-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes job-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+.job-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 7px;
+  font-size: 0.8rem;
+  color: var(--text-muted, var(--text-muted));
+}
+
+.job-progress-file {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 62%;
+}
+
+.job-progress-stats {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---------- Log panel ---------- */
+.log-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 2px 8px;
+  flex-wrap: wrap;
+}
+
+.log-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.log-count {
+  font-size: 0.78rem;
+  color: var(--text-muted, var(--text-muted));
+  font-variant-numeric: tabular-nums;
+}
+
+.log-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.log-filter {
+  font-size: 0.8rem;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.log-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.8rem;
+  color: var(--text-muted, var(--text-muted));
+  white-space: nowrap;
+}
+
+/* Level colouring, applied per line inside the log view. */
+.log-line-error { color: var(--error-text); font-weight: 600; }
+.log-line-warning { color: var(--warn-text); }
+.log-line-debug { color: var(--text-muted); }
+.log-line-info { color: inherit; }
+
+/* ---------- Live log stream ---------- */
+.log-panel {
+  border-left: 1px solid var(--line);
+  min-height: 0;
+}
+
+.log-stream {
+  overflow: auto;
+  min-height: 0;
+  padding: 4px 18px 18px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-stream:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.log-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.log-line {
+  padding: 1px 0;
+}
+
+.log-line-error .log-time,
+.log-line-warning .log-time {
+  color: inherit;
+  opacity: 0.6;
+}
+
+@media (max-width: 900px) {
+  .log-panel {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+}
+
+/* ---------- Retry note and failed files ---------- */
+.job-progress-retry {
+  margin: 8px 0 0;
+  font-size: 0.8rem;
+  color: var(--warn-text);
+}
+
+/* ---- download queue ---- */
+.download-queue {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  padding: 10px 12px;
+}
+
+.queue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-strong);
+}
+
+.queue-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.queue-current {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.queue-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.queue-index {
+  flex: 0 0 auto;
+  min-width: 1.4rem;
+  height: 1.4rem;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.queue-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.queue-name {
+  font-size: 0.84rem;
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-path {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+}
+
+.queue-item-actions .small {
+  min-width: 1.9rem;
+  padding: 2px 6px;
+  line-height: 1.2;
+}
+
+/* The submit button is "Add to queue" while a download runs: colour it as a
+   secondary action so it is clear it will not start immediately. */
+#downloadBtn.queue-mode {
+  background: var(--surface-sunken);
+  color: var(--text-strong);
+  border: 1px solid var(--line);
+}
+
+.failed-files {
+  margin-top: 12px;
+  border: 1px solid var(--error-border);
+  border-radius: 8px;
+  background: var(--error-bg);
+  padding: 10px 12px;
+}
+
+.failed-files-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--error-text);
+}
+
+.failed-files-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.failed-files-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 190px;
+  overflow: auto;
+  display: grid;
+  gap: 4px;
+}
+
+.failed-file {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.8rem;
+  border-top: 1px solid var(--error-border);
+  padding-top: 4px;
+}
+
+.failed-file-name {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
+  color: var(--text);
+}
+
+.failed-file-reason {
+  color: var(--error-text);
+  text-align: right;
+  flex-shrink: 0;
 }

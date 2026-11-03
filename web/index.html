@@ -4,7 +4,20 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20260503-precollect-syllabus">
+    <link rel="stylesheet" href="/styles.css?v=20261103-back">
+    <script>
+      // Applied before the body renders so a dark-theme user never sees a
+      // white flash while the stylesheet loads.
+      (function () {
+        try {
+          var stored = localStorage.getItem("courseraDownloader.theme");
+          var dark = stored
+            ? stored === "dark"
+            : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          if (dark) document.documentElement.setAttribute("data-theme", "dark");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <main class="app-shell">
@@ -17,6 +30,7 @@
           </div>
           <div class="header-actions">
             <button type="button" class="secondary" id="loginCheckBtn">Login</button>
+            <button type="button" class="secondary icon-toggle" id="themeToggleBtn" aria-label="Toggle dark theme" title="Toggle dark theme"></button>
             <button type="button" class="secondary settings-toggle" id="settingsToggleBtn" aria-label="Settings" title="Settings"></button>
           </div>
         </header>
@@ -57,9 +71,67 @@
                 </div>
 
                 <div class="field">
+                  <label for="jobs">Files at once</label>
+                  <select id="jobs" name="jobs">
+                    <option value="1">1 (safest)</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4" selected>4 (fast)</option>
+                    <option value="6">6</option>
+                    <option value="8">8 (max)</option>
+                  </select>
+                  <p class="field-hint">How many files download in parallel. Higher is faster but uses more bandwidth and connections.</p>
+                </div>
+
+                <div class="field">
+                  <label for="speed_limit">Speed limit</label>
+                  <select id="speed_limit" name="speed_limit">
+                    <option value="0" selected>Unlimited</option>
+                    <option value="256">256 KB/s</option>
+                    <option value="512">512 KB/s</option>
+                    <option value="1024">1 MB/s</option>
+                    <option value="2048">2 MB/s</option>
+                    <option value="5120">5 MB/s</option>
+                    <option value="10240">10 MB/s</option>
+                  </select>
+                  <p class="field-hint">Caps total download bandwidth across all files. Useful on shared or metered connections.</p>
+                </div>
+
+                <div class="field">
                   <label for="subtitle_language">Subtitle language</label>
                   <select id="subtitle_language" name="subtitle_language"></select>
                 </div>
+              </div>
+
+              <div class="field full">
+                <label for="auth_profile">Browser profile with your Coursera login</label>
+                <div class="path-row auth-row">
+                  <select id="auth_profile" name="auth_profile">
+                    <option value="">Auto-detect all browser profiles</option>
+                  </select>
+                  <button type="button" class="secondary" id="authApplyBtn">Use this login</button>
+                </div>
+                <p class="field-hint" id="authHint">
+                  Chrome keeps every profile (for example "Shah" and "Your Chrome") in its own folder,
+                  so pick the profile where you are signed in to Coursera.
+                </p>
+                <div class="path-row auth-row">
+                  <select id="auth_browser" name="auth_browser" aria-label="Browser to read the login from">
+                    <option value="">Any browser</option>
+                    <option value="firefox">Firefox</option>
+                    <option value="chrome">Chrome</option>
+                    <option value="edge">Edge</option>
+                    <option value="brave">Brave</option>
+                  </select>
+                  <button type="button" class="secondary" id="authRefreshBtn">Refresh profiles</button>
+                </div>
+                <input id="auth_cauth" name="auth_cauth" type="password" autocomplete="off"
+                       placeholder="Or paste a CAUTH cookie value">
+                <p class="field-hint">
+                  Chrome and Edge on Windows block cookie reading (app-bound encryption) unless the
+                  profile is readable. If detection still fails, copy the cookie manually:
+                  coursera.org → F12 → Application → Cookies → https://www.coursera.org → CAUTH.
+                </p>
               </div>
             </div>
           </section>
@@ -67,28 +139,95 @@
         </form>
 
         <section class="message" id="message" hidden></section>
+
+        <section class="download-queue" id="downloadQueue" hidden>
+          <div class="queue-head">
+            <strong id="queueTitle">Queue</strong>
+            <div class="queue-actions">
+              <button type="button" class="secondary small" id="clearQueueBtn"
+                      title="Remove every course from the queue">Clear queue</button>
+            </div>
+          </div>
+          <p class="queue-current" id="queueCurrent" hidden></p>
+          <ul class="queue-list" id="queueList"></ul>
+        </section>
+
+        <section class="job-progress" id="jobProgress" hidden>
+          <div class="job-progress-head">
+            <span class="job-progress-label" id="jobProgressLabel">Downloading</span>
+            <span class="job-progress-count" id="jobProgressCount"></span>
+          </div>
+          <div class="job-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+               aria-valuenow="0" id="jobProgressTrack">
+            <div class="job-progress-fill" id="jobProgressFill"></div>
+          </div>
+          <div class="job-progress-meta">
+            <span id="jobProgressFile" class="job-progress-file"></span>
+            <span id="jobProgressStats" class="job-progress-stats"></span>
+          </div>
+          <p class="job-progress-retry" id="jobRetryNote" hidden></p>
+        </section>
+
+        <section class="failed-files" id="failedFiles" hidden>
+          <div class="failed-files-head">
+            <strong id="failedFilesTitle">Failed files</strong>
+            <div class="failed-files-actions">
+              <button type="button" class="secondary small" id="retryFailedBtn">Retry failed</button>
+              <button type="button" class="secondary small" id="dismissFailedBtn" title="Hide this list (files stay failed on disk)">Dismiss</button>
+            </div>
+          </div>
+          <ul class="failed-files-list" id="failedFilesList"></ul>
+        </section>
       </section>
 
       <section class="activity">
         <button type="button" class="icon-button visually-hidden" id="refreshBtn" title="Refresh status">Refresh</button>
         <section id="recentCourses" class="recent-courses" hidden>
-          <h3>Recent courses</h3>
+          <h3 id="recentCoursesHeading" tabindex="-1">Recent courses</h3>
           <div id="recentCoursesGrid" class="recent-courses-grid"></div>
           <p id="recentCoursesEmpty" class="recent-courses-empty" hidden>No courses yet. Paste a Coursera URL above to begin.</p>
         </section>
         <div class="activity-body" id="activityBody" hidden>
           <div class="tree-panel">
             <div class="tree-toolbar">
+              <button type="button" class="secondary small back-button" id="backToCoursesBtn"
+                      title="Back to the recent courses list">← All courses</button>
               <button type="button" class="secondary small" id="expandTreeBtn">Expand all</button>
               <button type="button" class="secondary small" id="collapseTreeBtn">Collapse all</button>
+              <button type="button" class="secondary small" id="openCourseBtn" hidden
+                      title="Open this course folder in the file manager">Open folder</button>
+              <button type="button" class="secondary small" id="retryCourseBtn" hidden
+                      title="Re-run this course; only missing or failed files download">Retry missing</button>
+              <button type="button" class="secondary small danger" id="deleteCourseBtn" hidden
+                      title="Delete this course folder from disk">Delete course</button>
             </div>
             <aside class="activity-tree" id="activityTree"></aside>
           </div>
-          <div id="logs" class="activity-log"></div>
+          <div class="log-panel">
+            <div class="log-toolbar">
+              <div class="log-title">
+                <strong>Log</strong>
+                <span class="log-count" id="logCount"></span>
+              </div>
+              <div class="log-actions">
+                <select id="logLevelFilter" class="log-filter" aria-label="Minimum log level">
+                  <option value="all">All levels</option>
+                  <option value="info">Info and above</option>
+                  <option value="warning">Warnings and errors</option>
+                  <option value="error">Errors only</option>
+                </select>
+                <label class="log-toggle"><input type="checkbox" id="logAutoScroll" checked> Auto-scroll</label>
+                <button type="button" class="secondary small" id="logCopyBtn" title="Copy the whole log">Copy</button>
+                <button type="button" class="secondary small" id="logClearBtn" title="Clear the view (the download keeps running)">Clear</button>
+              </div>
+            </div>
+            <div id="logs" class="activity-log" hidden></div>
+            <div id="logStream" class="log-stream" tabindex="0"></div>
+          </div>
         </div>
       </section>
     </main>
 
-    <script src="/app.js?v=20260503-no-fallback-tree"></script>
+    <script src="/app.js?v=20261103-back"></script>
   </body>
 </html>

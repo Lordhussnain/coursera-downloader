@@ -2,6 +2,7 @@ import argparse
 import base64
 import html
 import json
+import shutil
 import logging
 import mimetypes
 import os
@@ -13,17 +14,76 @@ import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import re
 import string
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Python version guard.
+#
+# rookiepy decrypts browser cookies through a Rust extension whose newest
+# release (0.5.6) only ships Windows wheels for Python 3.7-3.12. On 3.13+ pip
+# tries to compile it from source and fails inside PyO3 with a wall of Rust
+# output that says nothing about the real problem. Fail early and say so.
+# ---------------------------------------------------------------------------
+MIN_PYTHON = (3, 8)
+MAX_PYTHON_EXCLUSIVE = (3, 13)
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _check_python_version():
+    current = sys.version_info[:2]
+    if MIN_PYTHON <= current < MAX_PYTHON_EXCLUSIVE:
+        return
+    lines = [
+        "",
+        "=" * 68,
+        "This app cannot run on Python %d.%d." % current,
+        "",
+        "The browser-cookie library it depends on (rookiepy) only supports",
+        "Python %d.%d to %d.%d. Newer versions do not exist yet." % (
+            MIN_PYTHON[0], MIN_PYTHON[1],
+            MAX_PYTHON_EXCLUSIVE[0], MAX_PYTHON_EXCLUSIVE[1] - 1,
+        ),
+        "",
+        "You are probably running a stray Python from PATH instead of your",
+        "Anaconda environment. Fix it with one of these:",
+        "",
+        "  Anaconda (recommended):",
+        "    Start menu -> Anaconda Prompt",
+        "    conda activate coursera_env",
+        "    cd /d %s" % APP_ROOT,
+        "    start_web_app.bat",
+        "",
+        "  Or point Python at the right interpreter directly:",
+        "    conda run -n coursera_env python web_app.py",
+        "",
+        "Check what you are running with:  python --version",
+        "=" * 68,
+        "",
+    ]
+    sys.stderr.write("\n".join(lines))
+    raise SystemExit(2)
+
+
+_check_python_version()
+
 import general
 from app_version import __version__
 from coursera_dl import main_f
 from define import OPENCOURSE_ONDEMAND_SPECIALIZATIONS_V1
-from downloaders import DownloadCancelled, set_download_control_events
+from downloaders import (
+    DownloadCancelled,
+    current_progress,
+    set_speed_limit,
+    failed_files,
+    reset_file_status,
+    reset_progress,
+    retrying_files,
+    set_download_control_events,
+)
 from localdb import SimpleDB
 
 
@@ -52,6 +112,33 @@ def disable_console_quick_edit():
         logging.debug("Could not disable console QuickEdit mode.", exc_info=True)
 
 
+# How many log entries to keep in memory per job. A long course produces
+# thousands of lines; the old 500 cap silently dropped the beginning.
+LOG_RETENTION = 20000
+
+# Upper bound for concurrent file downloads. Each job opens its own connection,
+# so this is a politeness limit towards Coursera as much as a sanity check.
+MAX_PARALLEL_JOBS = 8
+
+# Upper bound for the bandwidth cap (KB/s). 0 means unlimited.
+MAX_SPEED_LIMIT_KB = 1024 * 100
+
+_LEVEL_PATTERNS = (
+    ("ERROR", ("ERROR:", "Traceback (most recent call last)", "CRITICAL:")),
+    ("WARNING", ("WARNING:", "WARN:")),
+    ("DEBUG", ("DEBUG:",)),
+)
+
+
+def _log_level(message):
+    """Classify a raw log line so the UI can colour it meaningfully."""
+    text = str(message or "")
+    for level, markers in _LEVEL_PATTERNS:
+        if any(marker in text for marker in markers):
+            return level
+    return "INFO"
+
+
 class JobLogHandler(logging.Handler):
     def __init__(self, job):
         super().__init__()
@@ -75,31 +162,146 @@ class DownloadJob:
         self.error = ""
         self.command = []
         self.logs = []
+        self.log_seq = 0
         self.last_payload = None
         self.last_resume = False
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
+        # Queue of courses waiting for the current download to finish. Entries
+        # are prepared (command already built, so the URL was valid) but not
+        # started. One job runs at a time; this is what makes pasting a second
+        # link while the first is downloading an "add to queue" instead of a
+        # "start failed".
+        self.queue = []
+        self.queue_seq = 0
+        # Increments every time a job starts. The UI uses it to detect that the
+        # log belongs to a new run: log_seq restarts at 1, so without this the
+        # second course's log lines would be filtered out as "already seen".
+        self.job_seq = 0
 
     def add_log(self, message):
         with self.lock:
             timestamp = time.strftime("%H:%M:%S")
-            self.logs.append(f"[{timestamp}] {message}")
-            self.logs = self.logs[-500:]
+            self.log_seq += 1
+            entry = {
+                "seq": self.log_seq,
+                "time": timestamp,
+                "message": message,
+                "level": _log_level(message),
+            }
+            self.logs.append(entry)
+            # Keep a long history in memory: a full course easily logs more than
+            # the old 500-line cap, and truncation is what made the UI look like
+            # it was "missing" log lines.
+            if len(self.logs) > LOG_RETENTION:
+                del self.logs[: len(self.logs) - LOG_RETENTION]
 
-    def snapshot(self):
+    def snapshot(self, since=0):
+        """Return the job state. `since` streams only newer log entries."""
         with self.lock:
+            since = since or 0
+            if since:
+                entries = [entry for entry in self.logs if entry["seq"] > since]
+                first_seq = self.logs[0]["seq"] if self.logs else 0
+                # Tell the UI when entries were dropped from the front so it can
+                # resync instead of showing a log with holes in it.
+                resync = bool(self.logs) and since < first_seq - 1
+            else:
+                entries = list(self.logs)
+                resync = False
+            logs = ["[%s] %s" % (entry["time"], entry["message"]) for entry in entries]
             return {
                 "running": self.running,
                 "status": self.status,
                 "paused": self.pause_event.is_set(),
                 "error": self.error,
                 "command": redact_command(self.command),
-                "logs": list(self.logs),
+                "logs": logs,
+                "log_entries": entries,
+                "log_seq": self.log_seq,
+                "resync": resync,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "can_retry": self.last_payload is not None,
                 "last_was_resume": self.last_resume,
+                "progress": current_progress(),
+                "failed_files": failed_files(),
+                "retrying_files": retrying_files(),
+                "job_seq": self.job_seq,
+                "queue": [dict(entry) for entry in self.queue],
+                "current_course": self._current_course_locked(),
             }
+
+    def _current_course_locked(self):
+        """The course of the running job, for labelling the active item."""
+        if not self.running or not self.last_payload:
+            return ""
+        return self.last_payload.get("course", "").strip()
+
+    def queue_snapshot(self):
+        with self.lock:
+            return [dict(entry) for entry in self.queue]
+
+    def enqueue(self, payload, command, resume):
+        """Prepare a job to run after the current one.
+
+        The command is built up front so an invalid URL is rejected while the
+        user is still looking at the form, not silently an hour later when the
+        queue reaches it. Everything needed to start it is stored here, so a
+        queued course does not depend on the form still saying what it said.
+        """
+        course = str(payload.get("course", "")).strip()
+        with self.lock:
+            if any(entry.get("payload", {}).get("course", "").strip() == course for entry in self.queue):
+                raise ValueError("That course is already in the queue.")
+            if self.running and self._current_course_locked() == course:
+                raise ValueError("That course is already downloading.")
+            self.queue_seq += 1
+            entry = {
+                "id": self.queue_seq,
+                "course": course,
+                "class_name": str(payload.get("_class_name", "")),
+                "path": str(payload.get("path", "")).strip(),
+                "resume": bool(resume),
+                "added_at": time.time(),
+                "payload": dict(payload),
+                "command": list(command),
+            }
+            self.queue.append(entry)
+        self.add_log("Queued: %s" % (entry["class_name"] or course))
+        return dict(entry)
+
+    def dequeue(self, entry_id):
+        with self.lock:
+            for index, entry in enumerate(self.queue):
+                if entry.get("id") == entry_id:
+                    del self.queue[index]
+                    return True
+            return False
+
+    def clear_queue(self):
+        with self.lock:
+            count = len(self.queue)
+            self.queue = []
+        return count
+
+    def move_in_queue(self, entry_id, offset):
+        """Move a queued item up (-1) or down (+1). Returns True if it moved."""
+        with self.lock:
+            ids = [entry.get("id") for entry in self.queue]
+            if entry_id not in ids:
+                return False
+            index = ids.index(entry_id)
+            target = index + offset
+            if target < 0 or target >= len(self.queue):
+                return False
+            self.queue[index], self.queue[target] = self.queue[target], self.queue[index]
+            return True
+
+    def _pop_next_queued_locked(self):
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
 
     def remember_request(self, payload, resume):
         with self.lock:
@@ -112,6 +314,34 @@ class DownloadJob:
                 raise RuntimeError("No previous download request to retry.")
             return dict(self.last_payload), self.last_resume
 
+    def wait_for_stop(self, timeout=10):
+        """Block until the job thread has really finished (used before deleting).
+
+        Returns True if it stopped in time. The writer keeps file handles open
+        until the thread exits, and deleting under it both fails on Windows and
+        can leave a half-removed folder.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if not self.running:
+                    return True
+            time.sleep(0.1)
+        with self.lock:
+            return not self.running
+
+    def running_course(self, course_input, download_path):
+        """True when this exact course is the one being downloaded right now."""
+        with self.lock:
+            if not self.running or not self.last_payload:
+                return False
+            last_course = self.last_payload.get("course", "").strip()
+            last_path = self.last_payload.get("path", "").strip()
+        return (
+            last_course == (course_input or "").strip()
+            and Path(last_path).expanduser() == Path(download_path or "").expanduser()
+        )
+
     def has_request_for(self, course_input, download_path):
         with self.lock:
             if not self.last_payload:
@@ -120,15 +350,33 @@ class DownloadJob:
             last_path = self.last_payload.get("path", "").strip()
         return last_course == course_input and Path(last_path).expanduser() == Path(download_path).expanduser()
 
-    def start(self, command):
+    def start_or_queue(self, payload, command, resume):
+        """Run now if idle, otherwise add to the queue.
+
+        Returns ("started", None) or ("queued", entry). This is the behaviour a
+        user expects when pasting a second link while a course downloads.
+        """
+        with self.lock:
+            busy = self.running
+        if busy:
+            return "queued", self.enqueue(payload, command, resume)
+        self.start(command, payload=payload, resume=resume)
+        return "started", None
+
+    def start(self, command, payload=None, resume=False):
         with self.lock:
             if self.running:
                 raise RuntimeError("A download is already running.")
+            if payload is not None:
+                self.last_payload = dict(payload)
+                self.last_resume = bool(resume)
             self.running = True
             self.status = "running"
             self.error = ""
             self.command = list(command)
             self.logs = []
+            self.log_seq = 0
+            self.job_seq += 1
             self.started_at = time.time()
             self.finished_at = None
             self.cancel_event.clear()
@@ -165,10 +413,52 @@ class DownloadJob:
         self.add_log("Cancel requested.")
 
     def _run(self, command):
+        """Run jobs back to back: the requested one, then anything queued."""
+        pending = list(command)
+        while True:
+            outcome = self._run_one(pending)
+            with self.lock:
+                entry = self._pop_next_queued_locked() if outcome == "ok" else None
+                if entry is None:
+                    self.running = False
+                    self.pause_event.clear()
+                    self.cancel_event.clear()
+                    self.finished_at = time.time()
+                    return
+                # Claim the next job while still holding the lock, so a cancel
+                # arriving now cannot leave `running` False with a live thread.
+                self.status = "running"
+                self.error = ""
+                pending = list(entry.get("command") or [])
+                self.command = list(pending)
+                self.logs = []
+                self.log_seq = 0
+                self.job_seq += 1
+                self.started_at = time.time()
+                self.finished_at = None
+                self.cancel_event.clear()
+                self.pause_event.clear()
+                self.last_payload = dict(entry.get("payload") or {})
+                self.last_resume = bool(entry.get("resume"))
+                label = entry.get("class_name") or entry.get("course", "")
+            # Logged outside the lock: add_log() takes it, and threading.Lock is
+            # not reentrant, so calling it under the lock above would deadlock.
+            self.add_log("Queue: starting %s" % label)
+
+    def _run_one(self, command):
+        """Execute a single command. Returns "ok" when the queue may advance.
+
+        A cancelled or failed job stops the queue: the next course would very
+        likely hit the same problem, and silently burning through a queue of
+        courses after a failure is worse than stopping so the user can look.
+        """
         handler = JobLogHandler(self)
         root_logger = logging.getLogger()
         root_logger.addHandler(handler)
         set_download_control_events(self.cancel_event, self.pause_event)
+        reset_progress()
+        reset_file_status()
+        outcome = "ok"
         try:
             self.add_log("Resume started." if "--resume" in command else "Download started.")
             main_f(command)
@@ -177,11 +467,13 @@ class DownloadJob:
                 self.status = "canceled"
                 self.error = ""
             self.add_log("Download canceled.")
+            outcome = "stop"
         except Exception as exc:
             with self.lock:
                 self.status = "failed"
                 self.error = friendly_error_message(exc)
             self.add_log(traceback.format_exc())
+            outcome = "stop"
         else:
             with self.lock:
                 self.status = "completed"
@@ -189,17 +481,21 @@ class DownloadJob:
         finally:
             set_download_control_events(None, None)
             root_logger.removeHandler(handler)
-            with self.lock:
-                self.running = False
-                self.pause_event.clear()
-                self.cancel_event.clear()
-                self.finished_at = time.time()
-
+            reset_progress()
+        return outcome
 
 JOB = DownloadJob()
 AUTH_LOCK = threading.Lock()
 AUTH_CACHE = None
 AUTH_CACHE_TTL = 60
+AUTH_BROWSER_ORDER = ["firefox", "chrome", "edge", "brave"]
+PROFILE_ENDPOINTS = [
+    "https://api.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
+    "https://www.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
+    "https://www.coursera.org/api/userProfiles.v1?q=me&fields=fullName,name",
+    "https://www.coursera.org/api/users.v1/me?fields=fullName,name",
+    "https://www.coursera.org/api/memberships.v1?q=me&fields=name,fullName,email,emailAddress",
+]
 PROGRAM_COURSE_CACHE = {}
 PROGRAM_COURSE_FALLBACKS = {
     "ibm-ai-product-manager": [
@@ -233,24 +529,281 @@ def redact_command(command):
 
 def friendly_error_message(exc):
     message = str(exc)
-    if "appbound encryption" in message.lower():
+    lowered = message.lower()
+    # rookie reports app-bound encryption (Chrome 127+ / current Edge) as a bare
+    # "decrypt_encrypted_value failed", so match that too, not only the wording
+    # used by other cookie libraries.
+    decrypt_failed = "decrypt_encrypted_value failed" in lowered
+    if "appbound encryption" in lowered or "app-bound" in lowered or decrypt_failed:
+        if os.name == "nt":
+            return (
+                "Chrome/Edge protects this profile's cookies with Windows app-bound "
+                "encryption, so they cannot be read by another program. Sign in to "
+                "Coursera in Firefox, or paste the CAUTH cookie manually."
+            )
         return (
-            "Browser cookie access failed because Chrome/Edge protects cookies with "
-            "Windows app-bound encryption. Start the app with start_web_app.bat, "
-            "then click Login again."
+            "This browser profile protects its cookies with encryption that cannot "
+            "be read here. Sign in to Coursera in Firefox, or paste the CAUTH "
+            "cookie manually."
+        )
+    if "can't find cookies file" in lowered or "cannot find cookies file" in lowered:
+        return (
+            "No cookie database was found, which usually means the browser is "
+            "not installed or it was never opened."
+        )
+    if "ssl" in lowered or "proxy" in lowered or "max retries exceeded" in lowered:
+        return (
+            "%s. Check your internet connection, VPN, or proxy, then try again."
+            % message
+        )
+    # Only treat a lock/unlock wording as a cookie problem. Plain TLS, network
+    # and proxy errors must not be reported as a browser cookie issue.
+    if ("cookie" in lowered or "database" in lowered) and (
+        "locked" in lowered or "being used by another process" in lowered
+    ):
+        return (
+            "The browser cookie database is locked. Close the browser completely "
+            "(including from the system tray) and click Login again."
         )
     return message
 
 
 def auth_detection_error_message(details):
     logging.debug("Coursera login auto-detection details: %s", details)
+    text = str(details or "")
+    if "cannot be converted to 'PyString'" in text:
+        return (
+            "This version could not read Chrome/Edge cookies on Windows. "
+            "Update the app, or paste the CAUTH cookie under Settings."
+        )
+    if "app-bound" in text.lower() or "v20" in text.lower():
+        # Name the profile when we know it, so the user is not left guessing
+        # which of their Chrome profiles is the unreadable one.
+        labels = [label for label in PROFILE_ERRORS if PROFILE_ERRORS[label]]
+        if labels and "profile \"" in text:
+            named = ", ".join('"%s"' % label for label in labels)
+            return (
+                "Chrome protects the cookies in %s with app-bound encryption "
+                "(Chrome 127+), so no other program can read them - this is a "
+                "Chrome restriction, not a bug in the downloader. Easiest fix: "
+                "sign in at coursera.org in Firefox and pick Firefox in Settings. "
+                "Alternatively paste the CAUTH cookie under Settings."
+                % named
+            )
+        return (
+            "Chrome encrypted this profile's cookies with app-bound encryption, "
+            "which cannot be read by other programs. Sign in at coursera.org in "
+            "Firefox and pick it in Settings, or paste the CAUTH cookie under "
+            "Settings."
+        )
     return (
-        "Could not auto-detect your Coursera login. Start the app with "
-        "start_web_app.bat, then click Login again."
+        "Could not find a Coursera login in your browsers. If you are signed in "
+        "in a Chrome profile, open Settings, click Refresh profiles and choose "
+        "that profile. Otherwise log in with Firefox, or paste the CAUTH cookie "
+        "under Settings."
     )
 
 
-def detect_cauth_cookie():
+AUTH_PROFILE_HINTS = {}
+# Label -> reason, for profiles that could not be read during the last scan.
+PROFILE_ERRORS = {}
+CHROMIUM_BROWSERS = {"chrome", "edge", "brave"}
+FIREFOX_BROWSERS = {"firefox"}
+BROWSER_PATHS = {
+    "win32": {
+        "chrome": ["%LOCALAPPDATA%\\Google\\Chrome\\User Data"],
+        "edge": ["%LOCALAPPDATA%\\Microsoft\\Edge\\User Data"],
+        "brave": ["%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data"],
+        "firefox": ["%APPDATA%\\Mozilla\\Firefox"],
+    },
+    "darwin": {
+        "chrome": ["~/Library/Application Support/Google/Chrome"],
+        "edge": ["~/Library/Application Support/Microsoft Edge"],
+        "brave": ["~/Library/Application Support/BraveSoftware/Brave-Browser"],
+        "firefox": ["~/Library/Application Support/Firefox"],
+    },
+    "linux": {
+        "chrome": ["~/.config/google-chrome", "~/.config/google-chrome-beta"],
+        "edge": ["~/.config/microsoft-edge"],
+        "brave": ["~/.config/BraveSoftware/Brave-Browser"],
+        "firefox": ["~/.mozilla/firefox"],
+    },
+}
+PROFILE_COOKIE_FILES = {
+    "chromium": [Path("Network") / "Cookies", Path("Cookies")],
+    "firefox": [Path("cookies.sqlite")],
+}
+DEFAULT_CHROMIUM_PROFILE = "Default"
+
+
+def browser_platform_key():
+    if os.name == "nt":
+        return "win32"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
+def expand_env_path(raw_path):
+    """Expand %VAR% and $VAR/~ in a configured browser path.
+
+    os.path.expandvars only understands %VAR% on Windows, so expand it here and
+    keep the same behaviour on every platform (which also makes this testable).
+    """
+    expanded = str(raw_path)
+    for _ in range(3):
+        replaced = re.sub(
+            r"%([^%]+)%",
+            lambda match: os.environ.get(match.group(1), match.group(0)),
+            expanded,
+        )
+        replaced = os.path.expandvars(replaced)
+        if replaced == expanded:
+            break
+        expanded = replaced
+    return Path(os.path.expanduser(expanded))
+
+
+def browser_user_data_dirs(browser):
+    paths = BROWSER_PATHS.get(browser_platform_key(), {}).get(browser, [])
+    directories = []
+    for raw_path in paths:
+        expanded = expand_env_path(raw_path)
+        if expanded.is_dir():
+            directories.append(expanded)
+    return directories
+
+
+def find_profile_cookie_file(profile_dir, browser):
+    """Return the cookie database inside a browser profile folder, if any."""
+    candidates = PROFILE_COOKIE_FILES["firefox" if browser in FIREFOX_BROWSERS else "chromium"]
+    for relative in candidates:
+        candidate = Path(profile_dir) / relative
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_profile_display_name(profile_dir):
+    """Read the human readable profile name shown by Chrome/Edge/Brave."""
+    prefs_path = Path(profile_dir) / "Preferences"
+    try:
+        data = json.loads(prefs_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return ""
+    profile = data.get("profile") if isinstance(data, dict) else None
+    if not isinstance(profile, dict):
+        return ""
+    for key in ("name", "gaia_name", "local_profile_name"):
+        value = profile.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def describe_browser_profile(profile_dir, browser):
+    """Return (label, email, is_default) for a profile folder."""
+    label = read_profile_display_name(profile_dir) or Path(profile_dir).name
+    email = ""
+    if browser in CHROMIUM_BROWSERS:
+        try:
+            info = json.loads(
+                (Path(profile_dir) / "Signed In Profile").read_text(encoding="utf-8", errors="replace")
+            )
+            if isinstance(info, dict):
+                account = info.get("account_info")
+                if isinstance(account, list) and account and isinstance(account[0], dict):
+                    email = str(account[0].get("email") or "")
+        except (OSError, ValueError):
+            pass
+    return label, email, Path(profile_dir).name == DEFAULT_CHROMIUM_PROFILE
+
+
+def list_browser_profiles(browser):
+    """List the profiles of `browser` that have a readable cookie database."""
+    profiles = []
+    seen = set()
+    for user_data_dir in browser_user_data_dirs(browser):
+        if browser in FIREFOX_BROWSERS:
+            profile_dirs = [entry for entry in user_data_dir.iterdir() if entry.is_dir()]
+        else:
+            profile_dirs = [user_data_dir / DEFAULT_CHROMIUM_PROFILE]
+            profile_dirs.extend(
+                sorted(
+                    entry
+                    for entry in user_data_dir.iterdir()
+                    if entry.is_dir() and (entry.name == "Profile" or entry.name.startswith("Profile "))
+                )
+            )
+
+        for profile_dir in profile_dirs:
+            if not profile_dir.is_dir() or profile_dir in seen:
+                continue
+            seen.add(profile_dir)
+            cookie_file = find_profile_cookie_file(profile_dir, browser)
+            if cookie_file is None:
+                continue
+            label, email, is_default = describe_browser_profile(profile_dir, browser)
+            profiles.append({
+                "browser": browser,
+                "path": str(cookie_file),
+                "profile_dir": str(profile_dir),
+                "folder": profile_dir.name,
+                "label": label,
+                "email": email,
+                "is_default": is_default,
+            })
+
+    profiles.sort(key=lambda item: (not item["is_default"], item["path"].lower()))
+    return profiles
+
+
+def find_profile_by_path(path):
+    target = str(Path(path))
+    for browser in AUTH_BROWSER_ORDER:
+        for profile in list_browser_profiles(browser):
+            if profile["path"] == target or profile["profile_dir"] == target:
+                return profile
+    return None
+
+
+def normalize_cookie_domain(domain):
+    return str(domain or "").strip().lstrip(".").lower()
+
+
+def cookie_domain_order(cookie):
+    domain = normalize_cookie_domain(cookie.get("domain") if isinstance(cookie, dict) else getattr(cookie, "domain", None))
+    if domain.endswith("coursera.org"):
+        return 0
+    if domain.endswith("coursera.com"):
+        return 1
+    return 2
+
+
+def pick_cookie_value(cookies, name):
+    matches = []
+    for cookie in cookies or []:
+        cookie_name = cookie.get("name") if isinstance(cookie, dict) else getattr(cookie, "name", None)
+        if cookie_name != name:
+            continue
+        value = cookie.get("value") if isinstance(cookie, dict) else getattr(cookie, "value", None)
+        if value:
+            matches.append((-cookie_domain_order(cookie), cookie, value))
+
+    if not matches:
+        return None, None
+
+    matches.sort(key=lambda item: item[0])
+    return matches[0][2], matches[0][1]
+
+
+def read_browser_cookies(browser, profile_path=""):
+    """Read coursera.org cookies from a browser, or from one specific profile.
+
+    rookiepy's per-browser helpers only read the default profile folder, so a
+    login that lives in another Chrome/Edge profile is invisible to them. When a
+    profile cookie database path is given, the generic readers are used instead.
+    """
     try:
         import rookiepy
     except ModuleNotFoundError as exc:
@@ -259,66 +812,379 @@ def detect_cauth_cookie():
             "python -m pip install -r requirements.txt, then restart the app."
         ) from exc
 
-    errors = []
-    browser_order = ["firefox", "chrome", "edge", "brave"]
-    for browser in browser_order:
-        if browser not in general.ALLOWED_BROWSERS:
-            continue
-        cookie_loader = getattr(rookiepy, browser, None)
-        if cookie_loader is None:
-            continue
+    if profile_path:
+        return read_profile_cookies(rookiepy, browser, profile_path)
 
+    cookie_loader = getattr(rookiepy, browser, None)
+    if cookie_loader is None:
+        raise RuntimeError("Unsupported browser: %s" % browser)
+
+    # The browser helper only looks at the default profile, and it raises if that
+    # profile does not exist. Never let that hide the profiles we can list, which
+    # is exactly the situation of a user who only uses a named Chrome profile.
+    try:
+        cookies = cookie_loader(["coursera.org"])
+        default_error = None
+    except Exception as exc:
+        cookies = []
+        default_error = exc
+
+    extra_profiles = [
+        profile for profile in list_browser_profiles(browser)
+        if not profile["is_default"]
+    ]
+
+    if default_error is not None and not extra_profiles:
+        raise default_error
+
+    if not extra_profiles:
+        return cookies
+
+    merged = list(cookies)
+    seen = {(cookie.get("name"), cookie.get("value")) for cookie in cookies if isinstance(cookie, dict)}
+    for profile in extra_profiles:
         try:
-            cookies = cookie_loader(["coursera.org"])
+            profile_cookies = read_profile_cookies(rookiepy, browser, profile["path"])
         except Exception as exc:
-            errors.append(f"{browser}: {friendly_error_message(exc)}")
+            logging.debug("Could not read profile %s: %s", profile["path"], exc)
+            PROFILE_ERRORS[profile["label"]] = friendly_error_message(exc)
+            continue
+        added = False
+        holds_cauth = False
+        for cookie in profile_cookies:
+            key = (cookie.get("name"), cookie.get("value"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cookie)
+            added = True
+            if isinstance(cookie, dict) and cookie.get("name") == "CAUTH":
+                holds_cauth = True
+        # Remember which profile actually held the Coursera session, so the UI
+        # can report and store it instead of showing only the browser name.
+        if added and holds_cauth:
+            AUTH_PROFILE_HINTS[browser] = profile
+    return merged
+
+
+def find_local_state(profile_path):
+    """Locate the Chrome/Edge "Local State" file that holds the cookie key."""
+    directory = Path(profile_path).resolve().parent
+    for parent in list(directory.parents)[:4]:
+        candidate = parent / "Local State"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_profile_cookies(rookiepy, browser, profile_path):
+    """Read coursera.org cookies from one specific browser profile.
+
+    rookie's Python bindings disagree between platforms: on Windows
+    chromium_based(key_path, db_path, domains) needs the "Local State" key file
+    as its first argument, on Unix it is chromium_based(db_path, domains).
+    Calling it with the Unix signature on Windows fails with
+    "argument 'db_path': list object cannot be converted to 'PyString'".
+    """
+    cookie_file = Path(profile_path)
+    if not cookie_file.is_file():
+        raise RuntimeError("Cookie file not found: %s" % cookie_file)
+
+    if browser in FIREFOX_BROWSERS:
+        return rookiepy.firefox_based(str(cookie_file), ["coursera.org"])
+
+    domains = ["coursera.org"]
+    if os.name == "nt":
+        local_state = find_local_state(cookie_file)
+        if local_state is not None:
+            try:
+                return rookiepy.chromium_based(str(local_state), str(cookie_file), domains)
+            except TypeError as exc:
+                logging.debug("Windows 3-argument chromium_based failed: %s", exc)
+        else:
+            logging.debug("No Local State file above %s", cookie_file)
+        # Fall through to the 2-argument form for builds that expose it.
+        try:
+            return rookiepy.chromium_based(str(cookie_file), domains)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Could not read this browser profile: %s. Pasting the CAUTH "
+                "cookie manually still works." % exc
+            ) from exc
+
+    return rookiepy.chromium_based(str(cookie_file), domains)
+
+
+def resolve_auth_profile(profile=""):
+    """Return (browser, cookie file path) for a profile chosen by the user."""
+    profile = (profile or "").strip()
+    if not profile:
+        return "", ""
+    found = find_profile_by_path(profile)
+    if found:
+        return found["browser"], found["path"]
+    # A raw cookie database path that is no longer listed (profile renamed).
+    if Path(profile).is_file():
+        return "", profile
+    raise ValueError(
+        "That browser profile no longer exists. Open Settings and pick it again."
+    )
+
+
+def iter_cauth_sources(browser="", cookie_value="", failures=None, profile_path=""):
+    """Yield (source, cauth_cookie, cookies) for each possible login source.
+
+    `failures` is an optional dict that receives a human readable reason per
+    browser that could not provide a cookie. `profile_path` restricts the scan
+    to one browser profile (the one the user picked in Settings).
+    """
+    failures = failures if failures is not None else {}
+    AUTH_PROFILE_HINTS.clear()
+    PROFILE_ERRORS.clear()
+    cookie_value = (cookie_value or "").strip()
+    if cookie_value:
+        yield "manual", cookie_value, None
+        return
+
+    browser = (browser or "").strip().lower()
+    if profile_path:
+        # A chosen profile means: read that exact cookie database and nothing
+        # else. Resolve its browser so the right reader (chromium vs firefox)
+        # is used, and never fall back to scanning every browser afterwards.
+        if not browser:
+            found = find_profile_by_path(profile_path)
+            if found:
+                browser = found["browser"]
+        if not browser:
+            raise ValueError("Could not tell which browser that profile belongs to.")
+        browser_order = [browser]
+    else:
+        browser_order = [browser] if browser else []
+        for name in AUTH_BROWSER_ORDER:
+            if name not in browser_order:
+                browser_order.append(name)
+
+    for name in browser_order:
+        if name not in general.ALLOWED_BROWSERS:
+            continue
+        try:
+            cookies = read_browser_cookies(name, profile_path or "")
+        except Exception as exc:
+            logging.debug("Could not read %s cookies: %s", name, exc)
+            reason = friendly_error_message(exc)
+            failures[name] = reason
+            if profile_path:
+                # A single chosen profile failed: record it under the profile's
+                # own name so the message can say which one is unreadable.
+                found = find_profile_by_path(profile_path)
+                label = found["label"] if found else Path(profile_path).parent.parent.name
+                PROFILE_ERRORS[label] = reason
             continue
 
-        for cookie in cookies:
-            name = cookie.get("name") if isinstance(cookie, dict) else getattr(cookie, "name", None)
-            if name == "CAUTH":
-                value = cookie.get("value") if isinstance(cookie, dict) else getattr(cookie, "value", None)
-                if value:
-                    return browser, value, cookies
+        cauth_cookie, matched_cookie = pick_cookie_value(cookies, "CAUTH")
+        if cauth_cookie:
+            yield name, cauth_cookie, cookies
+            continue
 
-        errors.append(f"{browser}: CAUTH cookie not found")
-
-    detail = "; ".join(errors) if errors else "No supported browser cookie reader was available."
-    raise RuntimeError(auth_detection_error_message(detail))
+        logging.debug("%s returned %d cookies but no CAUTH cookie.", name, len(cookies))
+        failures[name] = "no CAUTH cookie for coursera.org"
 
 
-def detect_auth_status():
-    browser, cauth_cookie, browser_cookies = detect_cauth_cookie()
-    user_name = get_coursera_user_name(cauth_cookie, browser_cookies)
-    message = f"Logged in as {user_name}." if user_name else "Logged in."
-    if not user_name:
-        logging.debug("Authentication detected from %s, but no profile name was found.", browser)
+def report_auth_problem(details, failures=None):
+    failures = failures or {}
+    # Name the profiles that failed, so "not detected" is never ambiguous when
+    # the login lives in one specific Chrome profile.
+    problems = []
+    for label, reason in PROFILE_ERRORS.items():
+        problems.append('profile "%s": %s' % (label, reason))
+    if problems:
+        summary = "; ".join(problems)
+        if not details:
+            details = summary
+        elif summary not in details:
+            details = "%s | %s" % (details, summary)
+    if not details and failures:
+        details = "; ".join(
+            "%s: %s" % (name, reason) for name, reason in sorted(failures.items())
+        )
+    message = auth_detection_error_message(details)
+    logging.debug("Authentication problem: %s", message)
     return {
-        "authenticated": True,
-        "browser": browser,
-        "user_name": user_name,
+        "authenticated": False,
+        "browser": "",
+        "profile": "",
+        "profile_label": "",
+        "user_name": "",
         "message": message,
+        "warning": "",
+        "details": details,
     }
 
 
-def detect_auth_status_cached():
+def detect_auth_status(browser="", cookie_value="", profile_path=""):
+    details = []
+    failures = {}
+    candidates = 0
+    for source, cauth_cookie, cookies in iter_cauth_sources(browser, cookie_value, failures, profile_path):
+        candidates += 1
+        profile = fetch_coursera_profile(cauth_cookie, cookies)
+        if not profile.get("verified"):
+            details.append(
+                "%s: Coursera rejected the CAUTH cookie (%s)"
+                % (source, profile.get("error") or "unknown error")
+            )
+            continue
+
+        user_name = profile.get("user_name") or ""
+        message = "Logged in as %s." % user_name if user_name else "Logged in."
+        warning = profile.get("warning") or ""
+        if warning:
+            if source == "manual":
+                # A cookie pasted by the user is trusted until Coursera
+                # explicitly rejects it; the warning is only a heads-up.
+                message = "Logged in. Saved this CAUTH cookie, but Coursera did not return a profile for it. If downloads fail, copy a fresh cookie."
+            else:
+                message = "%s %s" % (message, warning)
+        logging.debug("Authentication detected from %s.", source)
+        profile_label = ""
+        resolved_profile = profile_path
+        if resolved_profile:
+            found = find_profile_by_path(resolved_profile)
+            profile_label = found["label"] if found else Path(resolved_profile).parent.name
+        else:
+            # Auto-detect may have found the cookie in a non-default profile.
+            hint = AUTH_PROFILE_HINTS.get(source)
+            if hint:
+                resolved_profile = hint["path"]
+                profile_label = hint["label"]
+        return {
+            "authenticated": True,
+            "browser": source,
+            "profile": resolved_profile,
+            "profile_label": profile_label,
+            "user_name": user_name,
+            "message": message,
+            "warning": warning,
+            "details": "",
+        }
+
+    if not candidates and cookie_value:
+        details.append("The CAUTH cookie is empty.")
+    elif not candidates:
+        for name in AUTH_BROWSER_ORDER:
+            if name in failures:
+                details.append("%s: %s" % (name, failures[name]))
+        details.append("No CAUTH cookie was found in any supported browser.")
+    return report_auth_problem("; ".join(details), failures)
+
+
+def fetch_coursera_profile(cauth_cookie, browser_cookies=None):
+    """Return {verified, user_name, warning, error} for a CAUTH cookie.
+
+    A cookie is only rejected when Coursera explicitly answers 401/403. Every
+    other outcome (offline, changed API, profile without a display name) keeps
+    the user logged in, because a wrong verdict would block working downloads.
+    """
+    session = requests.Session()
+    apply_browser_cookies(session, browser_cookies)
+    session.cookies.set("CAUTH", cauth_cookie, domain=".coursera.org")
+
+    reachable = False
+    saw_identity = False
+    try:
+        payload_name = get_name_from_cauth(cauth_cookie)
+    except Exception:
+        logging.debug("Could not read the CAUTH payload.", exc_info=True)
+        payload_name = ""
+
+    for endpoint in PROFILE_ENDPOINTS:
+        profile_name, profile_ids, status_code = get_name_from_profile_endpoint(session, endpoint)
+        reachable = reachable or bool(status_code)
+        if status_code in {401, 403}:
+            return {"verified": False, "user_name": "", "warning": "", "error": "HTTP %s" % status_code}
+        if profile_name:
+            return {"verified": True, "user_name": profile_name, "warning": "", "error": ""}
+        if profile_ids:
+            saw_identity = True
+        for profile_id in profile_ids:
+            name = get_name_from_profile_id(session, profile_id)
+            if name:
+                return {"verified": True, "user_name": name, "warning": "", "error": ""}
+
+    # Profile APIs do not always expose a display name; try the account pages.
+    page_name, page_status = get_name_from_coursera_pages(session)
+    reachable = reachable or bool(page_status)
+    if page_name:
+        return {"verified": True, "user_name": page_name, "warning": "", "error": ""}
+    if page_status in {401, 403}:
+        return {"verified": False, "user_name": "", "warning": "", "error": "HTTP %s" % page_status}
+
+    warning = ""
+    if reachable and not saw_identity:
+        warning = (
+            "Coursera did not return a profile for this cookie, so it may be "
+            "expired. Downloads will report an authentication error if so."
+        )
+        logging.debug("CAUTH accepted without profile data: %s", warning)
+    return {
+        "verified": True,
+        "user_name": payload_name,
+        "warning": warning,
+        "error": "",
+    }
+
+
+def get_name_from_profile_id(session, profile_id):
+    for endpoint in profile_endpoints_for_id(profile_id):
+        name, _profile_ids, status_code = get_name_from_profile_endpoint(session, endpoint)
+        if status_code in {401, 403}:
+            continue
+        if name:
+            return name
+    return ""
+
+
+def detect_auth_status_cached(force=False, browser="", cookie_value="", profile_path=""):
     global AUTH_CACHE
 
+    if cookie_value:
+        return detect_auth_status(browser, cookie_value, profile_path)
+
     now = time.time()
-    if AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
+    if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
         return dict(AUTH_CACHE["status"])
 
     with AUTH_LOCK:
         now = time.time()
-        if AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
+        if not force and AUTH_CACHE and now - AUTH_CACHE["saved_at"] < AUTH_CACHE_TTL:
             return dict(AUTH_CACHE["status"])
 
-        status = detect_auth_status()
+        status = detect_auth_status(browser, profile_path=profile_path)
         AUTH_CACHE = {
             "saved_at": now,
             "status": dict(status),
         }
         return status
+
+
+def remember_auth(status):
+    global AUTH_CACHE
+
+    AUTH_CACHE = {
+        "saved_at": time.time(),
+        "status": dict(status),
+    }
+
+
+def auth_payload(payload):
+    return (
+        (payload.get("browser") or "").strip().lower(),
+        (payload.get("cauth") or "").strip(),
+    )
+
+
+def auth_profile_from_payload(payload):
+    return str((payload or {}).get("profile") or "").strip()
 
 
 def apply_browser_cookies(session, browser_cookies):
@@ -334,34 +1200,6 @@ def apply_browser_cookies(session, browser_cookies):
         session.cookies.set(name, value, domain=domain or ".coursera.org")
 
 
-def get_coursera_user_name(cauth_cookie, browser_cookies=None):
-    session = requests.Session()
-    apply_browser_cookies(session, browser_cookies)
-    session.cookies.set("CAUTH", cauth_cookie, domain=".coursera.org")
-    endpoints = [
-        "https://api.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
-        "https://www.coursera.org/api/externalBasicProfiles.v1?q=me&fields=name,fullName,displayName,email,emailAddress,timezone,locale,privacy",
-        "https://www.coursera.org/api/userProfiles.v1?q=me&fields=fullName,name",
-        "https://www.coursera.org/api/users.v1/me?fields=fullName,name",
-        "https://www.coursera.org/api/memberships.v1?q=me&fields=name,fullName,email,emailAddress",
-    ]
-    seen_profile_ids = set()
-
-    for endpoint in endpoints:
-        name, profile_ids = get_name_from_profile_endpoint(session, endpoint)
-        if name:
-            return name
-        seen_profile_ids.update(profile_ids)
-
-    for profile_id in seen_profile_ids:
-        for endpoint in profile_endpoints_for_id(profile_id):
-            name, _ = get_name_from_profile_endpoint(session, endpoint)
-            if name:
-                return name
-
-    return get_name_from_coursera_pages(session) or get_name_from_cauth(cauth_cookie)
-
-
 def profile_endpoints_for_id(profile_id):
     encoded_id = str(profile_id).strip()
     return [
@@ -374,19 +1212,25 @@ def profile_endpoints_for_id(profile_id):
 
 
 def get_name_from_profile_endpoint(session, endpoint):
+    """Look up a profile name and report the HTTP status of the lookup.
+
+    The status matters: only an explicit 401/403 means the CAUTH cookie is no
+    longer valid, while an empty result just means Coursera had no name to give.
+    """
     try:
         response = session.get(endpoint, timeout=10)
         logging.debug("Profile lookup %s returned HTTP %s.", endpoint, response.status_code)
         if response.status_code in {404, 405}:
-            return "", set()
+            return "", set(), response.status_code
         response.raise_for_status()
         data = response.json()
     except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
         logging.debug("Profile lookup failed for %s: %s", endpoint, exc)
-        return "", set()
+        return "", set(), status
     except ValueError as exc:
         logging.debug("Profile lookup returned invalid JSON for %s: %s", endpoint, exc)
-        return "", set()
+        return "", set(), None
 
     candidates = []
     if isinstance(data, dict):
@@ -407,7 +1251,7 @@ def get_name_from_profile_endpoint(session, endpoint):
         logging.debug("Profile candidate keys: %s", sorted(candidate.keys()))
         name = extract_profile_name(candidate)
         if name:
-            return name, profile_ids
+            return name, profile_ids, response.status_code
         for key in ("id", "userId", "externalUserId"):
             value = candidate.get(key)
             if isinstance(value, str) and value.strip():
@@ -415,7 +1259,7 @@ def get_name_from_profile_endpoint(session, endpoint):
             elif isinstance(value, int):
                 profile_ids.add(str(value))
 
-    return "", profile_ids
+    return "", profile_ids, response.status_code
 
 
 def extract_profile_name(candidate):
@@ -470,6 +1314,7 @@ def get_name_from_coursera_pages(session):
         "https://www.coursera.org/account-profile",
         "https://www.coursera.org/user/edit",
     ]
+    last_status = None
     for url in urls:
         try:
             response = session.get(url, timeout=10)
@@ -477,12 +1322,13 @@ def get_name_from_coursera_pages(session):
             logging.debug("Profile page lookup failed for %s: %s", url, exc)
             continue
         logging.debug("Profile page lookup %s returned HTTP %s.", url, response.status_code)
-        if response.status_code != 200:
-            continue
-        name = extract_name_from_html(response.text)
-        if name:
-            return name
-    return ""
+        if response.status_code == 200:
+            name = extract_name_from_html(response.text)
+            if name:
+                return name, response.status_code
+        elif response.status_code in {401, 403}:
+            last_status = response.status_code
+    return "", last_status
 
 
 def extract_name_from_html(markup):
@@ -626,6 +1472,89 @@ def is_path_within_allowed_roots(path):
     return False
 
 
+def is_safe_delete_target(target, download_root):
+    """Guard rails for deleting a course folder.
+
+    Deleting files is the one destructive thing this app can do, so every check
+    below is deliberate: the target must sit *inside* the chosen download
+    folder (never the folder itself, never a parent, never the app folder), and
+    it must not be a drive root, the home directory, or a symlink escape.
+    """
+    try:
+        target = Path(target).expanduser().resolve()
+        root = Path(download_root).expanduser().resolve()
+    except OSError:
+        return False, "The folder path could not be resolved."
+
+    if not target.exists():
+        return False, "That folder no longer exists."
+
+    if not target.is_dir():
+        return False, "That path is a file, not a course folder."
+
+    # Refuse to delete the download folder itself.
+    if target == root:
+        return False, "Refusing to delete the whole download folder."
+
+    # Must be a strict child of the download folder.
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False, "That folder is outside the download folder."
+
+    # Never touch the app's own directory or anything above it.
+    try:
+        if target == ROOT or ROOT in target.parents:
+            return False, "Refusing to delete the application folder."
+    except OSError:
+        return False, "The folder path could not be checked."
+
+    if target == Path(target.anchor):
+        return False, "Refusing to delete a drive root."
+
+    try:
+        if target == Path.home().resolve():
+            return False, "Refusing to delete the home directory."
+    except OSError:
+        pass
+
+    return True, ""
+
+
+def folder_delete_summary(target):
+    """Count what would be removed, so the UI can warn honestly."""
+    files = 0
+    size = 0
+    for entry in Path(target).expanduser().resolve().rglob("*"):
+        if entry.is_file():
+            files += 1
+            try:
+                size += entry.stat().st_size
+            except OSError:
+                pass
+    return {"files": files, "bytes": size}
+
+
+def delete_course_folder(target, download_root):
+    """Delete one course folder after validating it. Returns a summary."""
+    allowed, reason = is_safe_delete_target(target, download_root)
+    if not allowed:
+        raise ValueError(reason)
+
+    target = Path(target).expanduser().resolve()
+    summary = folder_delete_summary(target)
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        # Windows often refuses while a file is still open (just-cancelled
+        # downloads keep a handle for a moment). Report it instead of pretending.
+        raise ValueError(
+            "Could not delete the folder: %s. If a download was just running, "
+            "wait a couple of seconds and try again." % exc
+        ) from exc
+    return summary
+
+
 def choose_download_folder(initial_path):
     initial_dir = Path(initial_path or default_download_folder()).expanduser()
     if not initial_dir.exists():
@@ -648,8 +1577,78 @@ def choose_download_folder(initial_path):
     return selected
 
 
+def resolve_download_auth(payload):
+    """Return {browser, cauth, profile} describing how to authenticate.
+
+    Prefers an explicit CAUTH cookie (typed in the UI), then the browser profile
+    the user picked, then whatever the last successful login check found, and
+    finally a previously saved CAUTH cookie.
+    """
+    browser, cauth_cookie = auth_payload(payload or {})
+    if cauth_cookie:
+        return {"browser": browser or "manual", "cauth": cauth_cookie, "profile": ""}
+
+    profile_path = auth_profile_from_payload(payload)
+    if profile_path:
+        profile_browser, cookie_file = resolve_auth_profile(profile_path)
+        return {"browser": profile_browser, "cauth": "", "profile": cookie_file}
+
+    if browser and browser != "manual":
+        return {"browser": browser, "cauth": "", "profile": ""}
+
+    cached = (AUTH_CACHE or {}).get("status") or {}
+    cached_browser = cached.get("browser") or ""
+    cached_profile = cached.get("profile") or ""
+    if cached.get("authenticated") and cached_profile:
+        profile_browser, cookie_file = resolve_auth_profile(cached_profile)
+        return {"browser": profile_browser, "cauth": "", "profile": cookie_file}
+    if cached.get("authenticated") and cached_browser and cached_browser != "manual":
+        return {"browser": cached_browser, "cauth": "", "profile": ""}
+
+    stored = load_stored_cauth()
+    if stored:
+        return {"browser": "manual", "cauth": stored, "profile": ""}
+
+    raise ValueError(
+        "Coursera login was not found. Click Login, sign in to coursera.org, "
+        "then try again."
+    )
+
+
+def load_stored_cauth():
+    try:
+        return str(SimpleDB("data.bin").read("argdict").get("ca", "") or "").strip()
+    except Exception:
+        logging.debug("Could not read the saved CAUTH cookie.", exc_info=True)
+        return ""
+
+
+def load_stored_profile():
+    try:
+        return str(SimpleDB("data.bin").read("auth_profile") or "").strip()
+    except Exception:
+        logging.debug("Could not read the saved browser profile.", exc_info=True)
+        return ""
+
+
+def save_stored_profile(profile_path):
+    try:
+        SimpleDB("data.bin").upsert("auth_profile", profile_path or "")
+    except Exception:
+        logging.debug("Could not save the browser profile.", exc_info=True)
+
+
+def save_stored_cauth(cauth_cookie):
+    try:
+        db = SimpleDB("data.bin")
+        db.upsert("argdict.ca", cauth_cookie or "")
+    except Exception:
+        logging.debug("Could not save the CAUTH cookie.", exc_info=True)
+
+
 def build_download_command(payload, resume=False, item=None):
-    detected_browser, cauth_cookie, _ = detect_cauth_cookie()
+    auth = resolve_download_auth(payload)
+    browser = auth["browser"]
     course_input = payload.get("course", "").strip()
     download_path = payload.get("path", "").strip()
     resolution = payload.get("video_resolution", "720p").strip()
@@ -684,6 +1683,18 @@ def build_download_command(payload, resume=False, item=None):
     if resolution not in {"360p", "540p", "720p"}:
         raise ValueError("Choose a valid video resolution.")
 
+    raw_jobs = payload.get("jobs", 1)
+    # `0 or 1` would silently become 1, hiding a bad value; treat empty as the
+    # default but validate anything else strictly.
+    if raw_jobs in (None, ""):
+        raw_jobs = 1
+    try:
+        jobs = int(raw_jobs)
+    except (TypeError, ValueError):
+        raise ValueError("Choose how many files to download at once.")
+    if jobs < 1 or jobs > MAX_PARALLEL_JOBS:
+        raise ValueError("Download at once must be between 1 and %d." % MAX_PARALLEL_JOBS)
+
     if language_name not in general.LANG_NAME_TO_CODE_MAPPING:
         raise ValueError("Choose a valid subtitle language.")
 
@@ -693,6 +1704,20 @@ def build_download_command(payload, resume=False, item=None):
         project_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ValueError(f"Could not create the project folder: {exc}") from exc
+
+    # Bandwidth cap in KB/s; 0 means unlimited.
+    raw_limit = payload.get("speed_limit", 0)
+    if raw_limit in (None, ""):
+        raw_limit = 0
+    try:
+        speed_limit_kb = int(raw_limit)
+    except (TypeError, ValueError):
+        raise ValueError("Choose a valid download speed limit.")
+    if speed_limit_kb < 0 or speed_limit_kb > MAX_SPEED_LIMIT_KB:
+        raise ValueError(
+            "Download speed must be between 0 (unlimited) and %d KB/s." % MAX_SPEED_LIMIT_KB
+        )
+    set_speed_limit(speed_limit_kb * 1024)
 
     language_code = general.LANG_NAME_TO_CODE_MAPPING[language_name]
     class_names = [class_name]
@@ -717,13 +1742,18 @@ def build_download_command(payload, resume=False, item=None):
         "--combined-section-lectures-nums",
         "--cache-syllabus",
         "--jobs",
-        "1",
+        str(jobs),
     ]
 
     if is_multi_course_program and len(class_names) > 1:
         command.append("--number-course-folders")
 
-    command[0:0] = ["--cauth", cauth_cookie]
+    if auth["profile"]:
+        command[0:0] = ["--cauth-auto", browser, "--cauth-profile", auth["profile"]]
+    elif auth["cauth"]:
+        command[0:0] = ["--cauth", auth["cauth"]]
+    else:
+        command[0:0] = ["--cauth-auto", browser]
 
     if language_code == "":
         command.extend(["--ignore-formats", "srt"])
@@ -740,14 +1770,13 @@ def build_download_command(payload, resume=False, item=None):
         command.extend(["--lecture_filter", re.escape(item_lecture)])
 
     return command, {
-        "browser": detected_browser,
+        "browser": browser if browser != "manual" else "",
         "argdict": {
-            "ca": "",
+            "ca": auth["cauth"] if browser == "manual" else "",
             "classname": course_input,
             "path": str(download_folder),
             "video_resolution": resolution,
             "sl": language_code,
-            "ca": "",
         },
     }
 
@@ -850,12 +1879,19 @@ def build_quick_activity(class_name, is_multi_course_program, selected_folder):
         site_tree = load_site_tree(course_slug, project_root)
         course_folder = find_existing_course_folder(course_slug, project_root)
         if not site_tree:
+            if course_folder:
+                # The course is on disk, only the manifest is gone. Scanning the
+                # folder is the quick path too: it is a directory walk, not a
+                # network call, and it stops a finished course from being
+                # labelled "missing".
+                groups.append(scan_course_folder(course_slug, course_folder, index, course_total))
+                continue
             groups.append({
                 "title": numbered_course_title(index, course_total, course_slug),
                 "slug": course_slug,
-                "status": "manifest-missing",
+                "status": "missing",
                 "tree_source": "missing",
-                "path": str(course_folder or ""),
+                "path": "",
                 "file_count": 0,
                 "downloadable_count": 0,
                 "expected_count": 0,
@@ -863,8 +1899,8 @@ def build_quick_activity(class_name, is_multi_course_program, selected_folder):
                 "order_total": course_total,
                 "modules": [],
                 "loose": [
-                    "Site tree manifest is missing. Refresh/resume this course to create "
-                    f"{course_slug}-site-tree.json."
+                    "This course has not been downloaded yet. "
+                    f"No folder and no {course_slug}-site-tree.json were found."
                 ],
             })
             continue
@@ -980,13 +2016,13 @@ def build_downloaded_activity(class_name, is_multi_course_program, selected_fold
                 modules, downloaded_items, downloadable_total, expected_total = [], 0, 0, 0
                 tree_source = "missing"
                 loose = [
-                    "Site tree manifest is missing. Refresh/resume this course to create "
-                    f"{course_slug}-site-tree.json. Folder scan fallback is disabled."
+                    "This course has not been downloaded yet. "
+                    f"No folder and no {course_slug}-site-tree.json were found."
                 ]
             groups.append({
                 "title": numbered_course_title(index, course_total, course_slug),
                 "slug": course_slug,
-                "status": "missing" if site_tree else "manifest-missing",
+                "status": "missing",
                 "tree_source": tree_source,
                 "path": "",
                 "file_count": downloaded_items,
@@ -1076,6 +2112,14 @@ def discover_downloaded_program_course_slugs(program_slug, selected_folder):
     return found
 
 
+def module_file_count(module):
+    """Count files across a scanned module's sections."""
+    total = 0
+    for section in module.get("sections", []) or []:
+        total += int(section.get("file_count") or 0)
+    return total
+
+
 def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0):
     scanned_modules = []
     loose_files = []
@@ -1106,14 +2150,19 @@ def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0)
             f"{total_files} real file{'s' if total_files != 1 else ''} on disk."
         ]
     else:
-        modules = []
-        downloadable_total = 0
-        expected_total = 0
-        status = "manifest-missing"
-        display_count = 0
+        # No manifest, but the course folder is right there and it was already
+        # scanned above. Report what is actually on disk instead of claiming the
+        # download is missing: a course downloaded on another machine (or before
+        # the manifest was written) is still perfectly complete.
+        modules = scanned_modules
+        downloadable_total = total_files
+        expected_total = total_files
+        total_items = sum(module_file_count(module) for module in modules)
+        status = "downloaded" if total_items else ("missing" if not total_files else "partial")
+        display_count = total_files
         loose = [
-            "Site tree manifest is missing. Refresh/resume this course to create "
-            f"{course_slug}-site-tree.json. Folder scan fallback is disabled."
+            f"Found {total_files} file{'s' if total_files != 1 else ''} on disk. "
+            "The site tree manifest is not available, so this list comes from the folder."
         ]
 
     if loose_files and site_tree:
@@ -1728,7 +2777,11 @@ def load_config():
         "languages": sorted(general.LANG_NAME_TO_CODE_MAPPING.keys()),
         "auth": {
             "mode": "auto",
-            "browsers": ["firefox", "chrome", "edge", "brave"],
+            "browsers": list(AUTH_BROWSER_ORDER),
+            # data.bin defaults "browser" to edge, so it is not a reliable
+            # record of the user's choice; the UI remembers the selection itself.
+            "has_saved_cauth": bool(str(argdict.get("ca", "") or "").strip()),
+            "saved_profile": load_stored_profile(),
         },
         "defaults": {
             "course": argdict.get("classname", ""),
@@ -1741,8 +2794,13 @@ def load_config():
 
 def save_config(config):
     db = SimpleDB("data.bin")
-    db.upsert("browser", config["browser"])
+    if config.get("browser"):
+        db.upsert("browser", config["browser"])
     for key, value in config["argdict"].items():
+        # Never overwrite a stored CAUTH cookie with an empty string; downloads
+        # usually run against a cookie that lives in memory only.
+        if key == "ca" and not value:
+            continue
         db.upsert(f"argdict.{key}", value)
 
 
@@ -1756,7 +2814,14 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(load_config())
             return
         if parsed.path == "/api/status":
-            self.send_json(JOB.snapshot())
+            # ?since=<seq> returns only log entries newer than that cursor, so
+            # polling stays cheap even for a course with thousands of lines.
+            query = parse_qs(parsed.query or "")
+            try:
+                since = int((query.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                since = 0
+            self.send_json(JOB.snapshot(since=since))
             return
         self.serve_static(parsed.path)
 
@@ -1774,8 +2839,26 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/resume":
                 self.start_download(payload, resume=True)
                 return
+            if parsed.path == "/api/queue":
+                self.queue_download(payload, resume=False)
+                return
+            if parsed.path == "/api/queue-resume":
+                self.queue_download(payload, resume=True)
+                return
+            if parsed.path == "/api/queue-remove":
+                self.queue_remove(payload)
+                return
+            if parsed.path == "/api/queue-clear":
+                self.queue_clear()
+                return
+            if parsed.path == "/api/queue-move":
+                self.queue_move(payload)
+                return
             if parsed.path == "/api/retry":
                 self.retry_download()
+                return
+            if parsed.path == "/api/retry-failed":
+                self.retry_failed_files()
                 return
             if parsed.path == "/api/download-state":
                 self.download_state(payload)
@@ -1795,6 +2878,12 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/cancel":
                 self.cancel_download()
                 return
+            if parsed.path == "/api/delete-course":
+                self.delete_course(payload)
+                return
+            if parsed.path == "/api/course-delete-info":
+                self.course_delete_info(payload)
+                return
             if parsed.path == "/api/select-folder":
                 self.select_folder(payload)
                 return
@@ -1805,7 +2894,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.open_login()
                 return
             if parsed.path == "/api/check-auth":
-                self.check_auth()
+                self.check_auth(payload)
+                return
+            if parsed.path == "/api/save-cauth":
+                self.save_cauth(payload)
+                return
+            if parsed.path == "/api/browser-profiles":
+                self.list_profiles()
                 return
             self.send_json({"error": "Not found"}, status=404)
         except ValueError as exc:
@@ -1814,13 +2909,50 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=500)
 
     def start_download(self, payload, resume, item=None):
+        command, config = build_download_command(payload, resume=resume, item=item)
         remembered_payload = dict(payload)
         if item:
             remembered_payload["item"] = dict(item)
-        JOB.remember_request(remembered_payload, resume)
-        command, config = build_download_command(payload, resume=resume, item=item)
         save_config(config)
-        JOB.start(command)
+        if item:
+            # Per-item retries always target the running/previous course; they
+            # are never queued, because they are a repair of an existing job.
+            JOB.remember_request(remembered_payload, resume)
+            JOB.start(command, payload=remembered_payload, resume=resume)
+            self.send_json({"ok": True, "status": JOB.snapshot()})
+            return
+        outcome, entry = JOB.start_or_queue(remembered_payload, command, resume)
+        self.send_json({
+            "ok": True,
+            "queued": outcome == "queued",
+            "entry_id": (entry or {}).get("id"),
+            "status": JOB.snapshot(),
+        })
+
+    def queue_download(self, payload, resume):
+        """Explicitly add a course to the queue, even while one is running."""
+        command, config = build_download_command(payload, resume=resume, item=None)
+        save_config(config)
+        entry = JOB.enqueue(dict(payload), command, resume)
+        self.send_json({"ok": True, "queued": True, "entry_id": entry["id"], "status": JOB.snapshot()})
+
+    def queue_remove(self, payload):
+        entry_id = payload.get("entry_id")
+        if not JOB.dequeue(entry_id):
+            raise ValueError("That item is no longer in the queue.")
+        self.send_json({"ok": True, "status": JOB.snapshot()})
+
+    def queue_clear(self):
+        removed = JOB.clear_queue()
+        self.send_json({"ok": True, "removed": removed, "status": JOB.snapshot()})
+
+    def queue_move(self, payload):
+        entry_id = payload.get("entry_id")
+        offset = int(payload.get("offset", 0))
+        if offset not in (-1, 1):
+            raise ValueError("Move offset must be -1 or 1.")
+        if not JOB.move_in_queue(entry_id, offset):
+            raise ValueError("That item cannot move any further.")
         self.send_json({"ok": True, "status": JOB.snapshot()})
 
     def retry_download(self):
@@ -1830,6 +2962,28 @@ class WebHandler(BaseHTTPRequestHandler):
         save_config(config)
         JOB.start(command)
         self.send_json({"ok": True, "status": JOB.snapshot(), "retry_resume": resume})
+
+    def retry_failed_files(self):
+        """Re-attempt the files that exhausted their retries.
+
+        The workflow marks in-progress files with a `.partial` file and only
+        re-downloads those on --resume, so this retries exactly the failed set
+        instead of re-scanning the whole course.
+        """
+        pending = failed_files()
+        if not pending:
+            self.send_json({"ok": False, "reason": "There are no failed files to retry."})
+            return
+        payload, _ = JOB.retry_request()
+        item = payload.get("item", {})
+        command, config = build_download_command(payload, resume=True, item=item)
+        save_config(config)
+        JOB.start(command)
+        self.send_json({
+            "ok": True,
+            "count": len(pending),
+            "status": JOB.snapshot(),
+        })
 
     def download_state(self, payload):
         self.send_json(get_download_state(payload))
@@ -1843,8 +2997,70 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "status": JOB.snapshot()})
 
     def cancel_download(self):
-        JOB.cancel()
-        self.send_json({"ok": True, "status": JOB.snapshot()})
+        try:
+            JOB.cancel()
+        except RuntimeError:
+            pass
+        # Cancelling the run also drops the queue: leaving courses queued behind
+        # a cancelled download would start them the moment the user pressed stop.
+        removed = JOB.clear_queue()
+        self.send_json({"ok": True, "queue_cleared": removed, "status": JOB.snapshot()})
+
+    def course_delete_info(self, payload):
+        """Report what a delete would remove, so the UI can ask before acting."""
+        target = str(payload.get("course_folder", "")).strip()
+        download_path = str(payload.get("path", "")).strip()
+        if not target or not download_path:
+            raise ValueError("Choose a course first.")
+        allowed, reason = is_safe_delete_target(target, download_path)
+        if not allowed:
+            self.send_json({"allowed": False, "reason": reason})
+            return
+        summary = folder_delete_summary(target)
+        busy = JOB.running_course(payload.get("course", ""), download_path)
+        self.send_json({
+            "allowed": True,
+            "reason": "",
+            "files": summary["files"],
+            "bytes": summary["bytes"],
+            "is_running": busy,
+            "folder": target,
+        })
+
+    def delete_course(self, payload):
+        target = str(payload.get("course_folder", "")).strip()
+        download_path = str(payload.get("path", "")).strip()
+        if not target or not download_path:
+            raise ValueError("Choose a course first.")
+
+        # Deleting the folder of a live download would fight the writer and leave
+        # a torn tree, so stop the job first and give it a moment to unwind.
+        stopped = False
+        if JOB.running_course(payload.get("course", ""), download_path):
+            try:
+                JOB.cancel()
+                stopped = True
+            except RuntimeError:
+                pass
+            JOB.wait_for_stop(timeout=10)
+
+        summary = delete_course_folder(target, download_path)
+        JOB.add_log(
+            "Deleted course folder %s (%d files, %.1f MB)%s"
+            % (
+                target,
+                summary["files"],
+                summary["bytes"] / (1024.0 * 1024.0),
+                " after stopping the running download" if stopped else "",
+            )
+        )
+        self.send_json({
+            "ok": True,
+            "stopped_download": stopped,
+            "files": summary["files"],
+            "bytes": summary["bytes"],
+            "status": JOB.snapshot(),
+        })
 
     def select_folder(self, payload):
         selected = choose_download_folder(payload.get("path", ""))
@@ -1882,9 +3098,31 @@ class WebHandler(BaseHTTPRequestHandler):
             "message": "Coursera login opened in your browser. After logging in, click Check Auth.",
         })
 
-    def check_auth(self):
+    def check_auth(self, payload=None):
+        payload = payload or {}
+        browser, cauth_cookie = auth_payload(payload)
+        profile_path = auth_profile_from_payload(payload)
         try:
-            status = detect_auth_status_cached()
+            # A cached result is only reused while it is positive and describes
+            # the same login source; otherwise a sign-in that just happened in
+            # the browser would be ignored for a full minute of auth polling.
+            cached_status = (AUTH_CACHE or {}).get("status") or {}
+            cached = bool(cached_status.get("authenticated"))
+            # Key the cache on the exact login source so switching browser or
+            # profile is never answered from a stale positive result.
+            same_source = (
+                (cached_status.get("profile") or "") == profile_path
+                and (cached_status.get("browser") or "") == (browser or "")
+            )
+            status = detect_auth_status_cached(
+                force=not (cached and same_source and not cauth_cookie),
+                browser=browser if browser != "manual" else "",
+                cookie_value=cauth_cookie,
+                profile_path=profile_path,
+            )
+            if status.get("authenticated") and cauth_cookie:
+                remember_auth(status)
+                save_stored_cauth(cauth_cookie)
             JOB.add_log(status["message"])
             self.send_json(status)
         except Exception as exc:
@@ -1892,8 +3130,40 @@ class WebHandler(BaseHTTPRequestHandler):
             logging.debug("Coursera auth check failed: %s", message)
             self.send_json({
                 "authenticated": False,
+                "user_name": "",
+                "browser": "",
                 "message": message,
             }, status=200)
+
+    def save_cauth(self, payload):
+        payload = payload or {}
+        browser, cauth_cookie = auth_payload(payload)
+        profile_path = auth_profile_from_payload(payload)
+        if not cauth_cookie and not profile_path and not browser:
+            raise ValueError("Choose a browser profile or paste a CAUTH cookie first.")
+        status = detect_auth_status_cached(
+            force=True,
+            browser=browser if browser != "manual" else "",
+            cookie_value=cauth_cookie,
+            profile_path=profile_path,
+        )
+        if status.get("authenticated"):
+            remember_auth(status)
+            if cauth_cookie:
+                save_stored_cauth(cauth_cookie)
+            if profile_path:
+                save_stored_profile(profile_path)
+            JOB.add_log(status["message"])
+        self.send_json(status)
+
+    def list_profiles(self):
+        profiles = []
+        for browser in AUTH_BROWSER_ORDER:
+            try:
+                profiles.extend(list_browser_profiles(browser))
+            except Exception:
+                logging.debug("Could not list %s profiles.", browser, exc_info=True)
+        self.send_json({"profiles": profiles, "selected": load_stored_profile()})
 
     def origin_is_allowed(self):
         host_header = self.headers.get("Host", "")

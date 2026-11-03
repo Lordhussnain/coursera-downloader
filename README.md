@@ -57,21 +57,175 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 
 # Installation and Setup
 
-1. Ensure you have Python 3.8+ installed.
+1. Ensure you have **Python 3.8 - 3.12** installed (3.10 is what this project targets). Python 3.13 and newer **do not work** - see [Python version](#python-version) below.
 2. Clone the repository and navigate to the directory.
-3. Create a virtual environment: `python -m venv .venv`
-4. Activate the virtual environment: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Linux/Mac)
-5. Install dependencies: `pip install -r requirements.txt`
-6. For the React frontend, ensure Node.js is installed, then run `npm install` in the `web/` directory.
+3. Install dependencies: `python -m pip install -r requirements.txt`
+
+### Python version
+
+| Python | Works? | Why |
+| --- | --- | --- |
+| 3.8 - 3.12 | Yes | Every dependency ships a ready-made wheel, including the browser-cookie library. |
+| 3.10 | Recommended | The version in `requirements.txt` and in the setup script. |
+| 3.13 / 3.14 / 3.15 | **No** | `rookiepy` (reads cookies from Chrome, Edge, Firefox) publishes no wheel past 3.12. `pip` then tries to compile it from source and fails inside PyO3, and `pillow==11.0.0` has no matching wheel either - you get a long Rust build error that never names the real cause. |
+
+`start_web_app.bat` therefore **skips interpreters newer than 3.12** when it looks
+for the one to run, and `web_app.py` refuses to start on one with a short
+explanation instead of a traceback. If your newest Python is 3.15 but you have an
+Anaconda environment, the launcher will pick the environment and ignore the 3.15.
+
+A virtual environment is optional. `start_web_app.bat` picks an interpreter automatically, in this order:
+
+1. the **activated conda environment** (`%CONDA_PREFIX%\python.exe`)
+2. a `.venv` folder next to `web_app.py`
+3. `python` on your `PATH` (including the `py` launcher)
+4. a previously created conda environment
+
+If the chosen interpreter is missing packages it runs `pip install -r requirements.txt` for you. There is no Node.js/npm build step - `web/` is plain HTML/CSS/JS served by the Python app.
+
+## Running with Anaconda (Windows)
+
+The quickest route: double-click **`setup_env.bat`** once. It finds conda, creates
+a `coursera_env` environment on Python 3.10, installs the requirements, and
+verifies they import. Then just double-click `start_web_app.bat` - it picks that
+environment up by itself, no activation needed.
+
+To do the same steps by hand, open the **Anaconda Prompt** from the Start menu (not the plain `cmd` window, which does not know the `conda` command unless you ran `conda init cmd.exe`):
+
+```bat
+conda create -n coursera_env python=3.10 -y
+conda activate coursera_env
+cd /d C:\Users\<you>\corsera-down\coursera-downloader
+python -m pip install -r requirements.txt
+start_web_app.bat
+```
+
+Only the first two commands are one-time setup. On every later run you just need
+`conda activate coursera_env`, the `cd`, and `start_web_app.bat`.
+
+The launcher prints `Using conda environment coursera_env:` followed by the interpreter path, so you can confirm your environment is the one running. Then open <http://localhost:7500>.
+
+Alternatively, without activating anything - run the env's Python directly:
+
+```bat
+conda run -n coursera_env python -m pip install -r requirements.txt
+conda run -n coursera_env python web_app.py
+```
+
+Notes:
+
+- You do **not** need to create a `.venv`. If an old `.venv` folder is left in the project, an activated conda environment still takes priority.
+- Keep the console window open while downloading; it is the app's server.
+- To leave the environment later: `conda deactivate`.
+
+#### If something goes wrong
+
+| Symptom | Fix |
+|---|---|
+| `'conda' is not recognized` | You are in `cmd`. Open **Anaconda Prompt** instead. |
+| `activate` does nothing / wrong Python | Run `conda activate coursera_env` again and check the prompt shows `(coursera_env)`. |
+| `ModuleNotFoundError` on start | Dependencies went into a different Python. Re-run `python -m pip install -r requirements.txt` **after** activating. |
+| Port 7500 already in use | An earlier instance is still running. Close its console window, or run `python web_app.py --port 7501`. |
+| Browser shows an old UI after updating | Press `Ctrl+Shift+R` to bypass the cached CSS/JS. |
+| `pip` is slow or fails | `python -m pip install --upgrade pip` then retry, or add `-i https://pypi.org/simple`. |
+| Long Rust/Cargo error or `RequiredDependencyException: zlib` while installing | Your Python is 3.13+. `rookiepy` has no wheel past 3.12. See [Python version](#python-version) - run `setup_env.bat`, or `conda create -n coursera_env python=3.10 -y`. |
+| `Defaulting to user installation` in pip output | pip is installing into a stray Python (e.g. `AppData\Roaming\Python\Python315`), not your environment. Activate the environment first, then use `python -m pip`. |
+| `This app cannot run on Python 3.15` | Working as intended. Start it through `start_web_app.bat`, which picks the 3.10 environment, or `conda run -n coursera_env python web_app.py`. |
+| A finished course says "Manifest missing" | Fixed in v3.8.2 - the tree is rebuilt from the folder when the manifest is absent. If you are on an older build, delete the course from the list and re-add it, or press **Retry missing**. |
 
 # Usage
 
 1. Start the web app: Run `start_web_app.bat` (Windows) or `python web_app.py` (cross-platform).
 2. Open your browser to `http://localhost:7500`.
-3. Log in using your Coursera credentials or CAUTH cookie.
+3. Click **Login**, sign in to Coursera in the browser window that opens, then click **Login** again.
 4. Select and download courses.
 
-**Note**: The app extracts CAUTH cookies from your browser for authentication. Ensure you are logged into Coursera in your browser (Chrome, Firefox, etc.) before use.
+## Recent courses
+
+When the app opens it lists the courses you have pasted before. Click one to see
+its file tree and log. Press **← All courses** at the left of the toolbar to go
+back and pick a different course - the list stays available even while a
+download is running.
+
+## Queueing several courses
+
+Paste a course URL and press **Download**. While that course is downloading the
+button reads **Add to queue**: paste the next URL and press it again. Repeat for
+as many courses as you like - they download one after another, automatically,
+with no need to wait and no need to press anything between them.
+
+- The **Queue** panel lists what is waiting, in order, and names the course
+  downloading right now.
+- Each row has **↑**, **↓** and **×** to reorder or remove it.
+- **Clear queue** drops everything waiting; the current course keeps downloading.
+- **Pause** / **Resume** on their own button control the running download. They
+  are no longer attached to the Download button, so adding to the queue can
+  never pause what is running.
+- **Cancel** stops the current course *and* clears the queue, so nothing starts
+  behind your back after you press stop.
+- If a course fails (bad URL, expired login), the queue stops there instead of
+  working through the rest, so one broken link cannot silently burn the whole
+  list. The failure is shown and the remaining courses stay queued.
+
+## Login / authentication
+
+The app never asks for your Coursera password. It reuses the `CAUTH` session cookie from a browser you are already signed in to.
+
+- **Pick the right browser profile.** Chrome, Edge and Brave keep each profile (`Default`, `Profile 1`, ...) in its own folder with its own cookie database. The old build only ever read `Default`, so a login made in a profile named e.g. "Shah" was invisible. Now the app scans every profile, and **Settings -> Browser profile with your Coursera login** lets you point it at the exact one (use **Refresh profiles** after creating a profile or signing in), then click **Use this login**.
+- **Firefox is the most reliable source.** Windows protects Chrome and Edge cookies with *app-bound encryption* (Chrome 127+, current Edge). No external program - including this app, even when run as administrator - can read those cookies. Selecting the profile helps when the profile is readable; if it reports that the cookies are encrypted, use Firefox or paste the cookie.
+- If auto-detection still fails (Chrome/Edge only, or a locked cookie database), paste the cookie manually:
+  1. Sign in at `https://www.coursera.org` in any browser.
+  2. Press `F12` -> **Application** -> **Cookies** -> `https://www.coursera.org`.
+  3. Copy the `CAUTH` value, paste it into **Settings -> CAUTH cookie**, then click **Use this login**.
+
+A CAUTH cookie copied by hand keeps working from any browser, and it is stored locally in `data.bin` (git-ignored) so downloads keep working on the next start.
+
+### Retries and failed files
+
+Every file is retried on its own, so a dropped connection no longer aborts the
+whole course (that used to happen: one network error killed every remaining
+file).
+
+- **4 attempts per file** with exponential backoff and jitter, so retries do not
+  stampede the server.
+- **Resumes, not restarts**: a retry continues from the bytes already on disk.
+- **Timeouts** (15s connect, 60s read) so a stalled socket never hangs forever.
+- **Permanent errors fail fast**: a 404 is not retried four times.
+- **Truncated bodies are detected** and retried instead of being reported as
+  success.
+
+When a file does exhaust its retries, the web UI lists it under **Failed files**
+with the reason and a **Retry failed** button. The **Retry missing** button
+re-runs the course with `--resume`, which re-downloads only files still carrying
+a `.partial` marker.
+
+### Speed limit
+
+**Settings -> Speed limit** caps total bandwidth across all files (Unlimited by
+default). Useful on metered or shared connections; the cap is global, so 2 MB/s
+is 2 MB/s in total even with 4 files in flight.
+
+### Diagnosing a login that is not detected
+
+If one profile works and another does not, run the diagnostic script in the same
+environment as the app:
+
+```bat
+conda activate coursera_env
+cd /d C:\Users\shah\corsera-down\coursera-downloader
+python diagnose_cookies.py
+```
+
+It checks every browser profile separately and reports, per profile:
+
+- whether a `Local State` key file was found
+- whether rookie could open the cookie database
+- **how the `CAUTH` row is actually stored** - `plaintext`, `v10` (legacy, readable) or `v20` (app-bound, readable only by Chrome itself)
+- whether a usable `CAUTH` cookie came back
+
+That distinction is the quick way to tell "this profile really is protected by
+Chrome" apart from "something else is wrong, such as the browser holding the
+database open". Cookie values are masked in the output, so it is safe to share.
 
 # Security
 

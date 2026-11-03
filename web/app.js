@@ -5,6 +5,7 @@ const pathInput = document.querySelector("#path");
 const versionLabel = document.querySelector("#version");
 const messageBox = document.querySelector("#message");
 const logs = document.querySelector("#logs");
+const logStream = document.querySelector("#logStream");
 const activityTree = document.querySelector("#activityTree");
 const jobState = document.querySelector("#jobState");
 const downloadBtn = document.querySelector("#downloadBtn");
@@ -14,15 +15,58 @@ const refreshBtn = document.querySelector("#refreshBtn");
 const selectFolderBtn = document.querySelector("#selectFolderBtn");
 const loginCheckBtn = document.querySelector("#loginCheckBtn");
 const settingsToggleBtn = document.querySelector("#settingsToggleBtn");
+const themeToggleBtn = document.querySelector("#themeToggleBtn");
+const deleteCourseBtn = document.querySelector("#deleteCourseBtn");
+const openCourseBtn = document.querySelector("#openCourseBtn");
+const retryCourseBtn = document.querySelector("#retryCourseBtn");
 const settingsPanel = document.querySelector("#settingsPanel");
 const expandTreeBtn = document.querySelector("#expandTreeBtn");
 const collapseTreeBtn = document.querySelector("#collapseTreeBtn");
 const courseClearBtn = document.querySelector("#courseClearBtn");
+const downloadQueue = document.querySelector("#downloadQueue");
+const queueList = document.querySelector("#queueList");
+const queueTitle = document.querySelector("#queueTitle");
+const queueCurrent = document.querySelector("#queueCurrent");
+const clearQueueBtn = document.querySelector("#clearQueueBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
+const backToCoursesBtn = document.querySelector("#backToCoursesBtn");
+const authBrowserSelect = document.querySelector("#auth_browser");
+const authProfileSelect = document.querySelector("#auth_profile");
+const authRefreshBtn = document.querySelector("#authRefreshBtn");
+const authCauthInput = document.querySelector("#auth_cauth");
+const authApplyBtn = document.querySelector("#authApplyBtn");
+const authHint = document.querySelector("#authHint");
 const activityBody = document.querySelector("#activityBody");
+const jobProgress = document.querySelector("#jobProgress");
+const jobProgressLabel = document.querySelector("#jobProgressLabel");
+const jobProgressCount = document.querySelector("#jobProgressCount");
+const jobProgressTrack = document.querySelector("#jobProgressTrack");
+const jobProgressFill = document.querySelector("#jobProgressFill");
+const jobProgressFile = document.querySelector("#jobProgressFile");
+const jobProgressStats = document.querySelector("#jobProgressStats");
+const logCount = document.querySelector("#logCount");
+const logLevelFilter = document.querySelector("#logLevelFilter");
+const logAutoScroll = document.querySelector("#logAutoScroll");
+const logCopyBtn = document.querySelector("#logCopyBtn");
+const logClearBtn = document.querySelector("#logClearBtn");
+const jobRetryNote = document.querySelector("#jobRetryNote");
+const failedFiles = document.querySelector("#failedFiles");
+const failedFilesList = document.querySelector("#failedFilesList");
+const failedFilesTitle = document.querySelector("#failedFilesTitle");
+const retryFailedBtn = document.querySelector("#retryFailedBtn");
+const dismissFailedBtn = document.querySelector("#dismissFailedBtn");
 
 let statusTimer = null;
+// Live log buffer. The server streams only entries newer than logCursor, so a
+// long course never re-sends (or silently truncates) its whole log.
+let logEntries = [];
+let logCursor = 0;
+let logHiddenBefore = 0;
+let downloadCount = 0;
+let currentCourseFolder = "";
+let currentCourseName = "";
+let lastProgressKey = "";
 let loginOpened = false;
 let authPollTimer = null;
 let loginWindow = null;
@@ -43,10 +87,31 @@ let lastDownloadStateAt = 0;
 let downloadStatePromise = null;
 const expandedTreeIds = new Set();
 
+const AUTH_BROWSER_STORAGE_KEY = "courseraDownloader.authBrowser";
+const AUTH_PROFILE_STORAGE_KEY = "courseraDownloader.authProfile";
+const AUTH_HINT_MESSAGE =
+  "Login not detected yet. Sign in to coursera.org in the same browser, then click Login again. " +
+  "Chrome and Edge cookies are protected on Windows, so Firefox is the most reliable choice. " +
+  "You can also paste the CAUTH cookie under Settings.";
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20260503-no-fallback-tree");
+console.info("Coursera Downloader UI loaded: 20261103-back");
+
+// Restore log view preferences. Reading them here (not at first poll) means the
+// filter is already correct when the first lines arrive.
+try {
+  const savedLevel = localStorage.getItem("courseraDownloader.logLevel");
+  if (savedLevel && document.querySelector("#logLevelFilter")) {
+    document.querySelector("#logLevelFilter").value = savedLevel;
+  }
+  const savedScroll = localStorage.getItem("courseraDownloader.logAutoScroll");
+  if (savedScroll !== null && document.querySelector("#logAutoScroll")) {
+    document.querySelector("#logAutoScroll").checked = savedScroll !== "0";
+  }
+} catch {
+  /* localStorage can be unavailable in private mode */
+}
 
 function treeNeedsStateRender() {
   return (
@@ -113,6 +178,59 @@ function fillSelect(select, items, selected) {
   });
 }
 
+const JOBS_STORAGE_KEY = "courseraDownloader.jobs";
+
+function restoreJobsPreference() {
+  const select = document.querySelector("#jobs");
+  if (!select) return;
+  try {
+    const saved = localStorage.getItem(JOBS_STORAGE_KEY);
+    if (saved) {
+      const option = Array.from(select.options).find((o) => o.value === saved);
+      if (option) select.value = saved;
+    }
+  } catch {
+    /* ignore unavailable storage */
+  }
+}
+
+// Wire the control once, at load, so it works even before the first download
+// state request completes.
+(function initJobsPreference() {
+  restoreJobsPreference();
+  const select = document.querySelector("#jobs");
+  if (!select) return;
+  select.addEventListener("change", () => {
+    try {
+      localStorage.setItem(JOBS_STORAGE_KEY, select.value);
+    } catch {
+      /* ignore */
+    }
+  });
+})();
+
+const SPEED_STORAGE_KEY = "courseraDownloader.speedLimit";
+
+(function initSpeedPreference() {
+  const select = document.querySelector("#speed_limit");
+  if (!select) return;
+  try {
+    const saved = localStorage.getItem(SPEED_STORAGE_KEY);
+    if (saved && Array.from(select.options).some((o) => o.value === saved)) {
+      select.value = saved;
+    }
+  } catch {
+    /* ignore */
+  }
+  select.addEventListener("change", () => {
+    try {
+      localStorage.setItem(SPEED_STORAGE_KEY, select.value);
+    } catch {
+      /* ignore */
+    }
+  });
+})();
+
 function payloadFromForm() {
   const formData = new FormData(form);
   return {
@@ -120,6 +238,8 @@ function payloadFromForm() {
     path: formData.get("path"),
     video_resolution: formData.get("video_resolution"),
     subtitle_language: formData.get("subtitle_language"),
+    jobs: Number(formData.get("jobs")) || 1,
+    speed_limit: Number(formData.get("speed_limit")) || 0,
   };
 }
 
@@ -155,13 +275,17 @@ function clearCourseInput() {
   courseInput.focus();
 }
 
+// True while the recent-courses list is the visible screen. The status poll
+// renders the tree on every tick, which used to yank the landing away the
+// moment a course folder had any content. This flag lets an explicit Back
+// click win over that until the user picks a course again.
+let showingCourseLanding = false;
+
 function showRecentCoursesLanding() {
   if (!recentCoursesSection || !activityBody) return;
-  if (courseInput.value.trim() || downloadedActivityGroups.length) {
-    recentCoursesSection.hidden = true;
-    activityBody.hidden = false;
-    return;
-  }
+  // Always show the list when asked. This used to return early whenever a
+  // course was loaded or the input had text, so the Back button had nothing
+  // to show: the landing could be hidden but never brought back.
   const list = getCourseHistory();
   const empty = document.querySelector("#recentCoursesEmpty");
   recentCoursesGrid.innerHTML = list.map((url) => `
@@ -175,11 +299,33 @@ function showRecentCoursesLanding() {
   if (empty) empty.hidden = list.length > 0;
   recentCoursesSection.hidden = false;
   activityBody.hidden = true;
+  showingCourseLanding = true;
+  updateBackButton();
 }
 
-function hideRecentCoursesLanding() {
+function hideRecentCoursesLanding(options) {
+  // The background poll must not pull the user out of the list they just
+  // navigated back to; only an explicit action (picking a course, typing a
+  // URL, starting a download) should.
+  if (options && options.auto && showingCourseLanding) return;
+  showingCourseLanding = false;
   if (recentCoursesSection) recentCoursesSection.hidden = true;
   if (activityBody) activityBody.hidden = false;
+  updateBackButton();
+}
+
+// The Back button only makes sense when there is a list to go back to, so it is
+// hidden when the history is empty rather than offering a dead end.
+function updateBackButton() {
+  if (!backToCoursesBtn) return;
+  const hasHistory = getCourseHistory().length > 0;
+  const onLanding = recentCoursesSection ? !recentCoursesSection.hidden : false;
+  backToCoursesBtn.hidden = !hasHistory || onLanding;
+  backToCoursesBtn.textContent = "\u2190 All courses";
+  const viewing = courseInput && courseInput.value.trim() ? courseInput.value.trim() : "";
+  backToCoursesBtn.title = viewing
+    ? `Back to the recent courses list (currently viewing ${courseTitleFromUrl(viewing)})`
+    : "Back to the recent courses list";
 }
 
 function courseTitleFromUrl(url) {
@@ -286,21 +432,29 @@ function refreshDownloadButton() {
   const canceling = state === "canceling";
 
   const completed = isCurrentCourseCompleted();
+
+  // The submit button is never a pause button. It used to turn into "Pause"
+  // while a download ran, which is why pasting a second link paused the first
+  // instead of queueing it. Pausing is what the dedicated Pause button is for.
   downloadBtn.disabled = canceling;
-  downloadBtn.textContent = canceling
-    ? "Canceling"
+  downloadBtn.textContent = running
+    ? "Add to queue"
     : paused
       ? "Resume"
-      : running
-        ? "Pause"
-        : completed
-          ? "Preview"
-          : canResumeCurrentCourse
-            ? "Resume"
-            : "Download";
+      : completed
+        ? "Preview"
+        : canResumeCurrentCourse
+          ? "Resume"
+          : "Download";
   downloadBtn.classList.toggle("preview-mode", !running && !canceling && completed);
+  downloadBtn.classList.toggle("queue-mode", running && !canceling);
+  downloadBtn.title = running
+    ? "Download this course after the current one finishes"
+    : "";
 
-  pauseBtn.hidden = true;
+  // Pause/Resume becomes a real, visible control while a job is running.
+  pauseBtn.hidden = !running || canceling;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
   cancelBtn.hidden = !running;
   cancelBtn.disabled = canceling;
 }
@@ -361,9 +515,80 @@ function cleanAuthMessage(text) {
 function cleanDisplayMessage(text) {
   const message = cleanAuthMessage(text);
   if (/could not auto-detect your coursera login/i.test(message)) {
-    return "Could not auto-detect your Coursera login. Start the app with start_web_app.bat, then click Login again.";
+    return AUTH_HINT_MESSAGE;
   }
   return message;
+}
+
+function authFailureMessage(result) {
+  const details = String((result && result.details) || "").trim();
+  if (!details) return AUTH_HINT_MESSAGE;
+  return `${AUTH_HINT_MESSAGE} Details: ${details}`;
+}
+
+function setAuthHint(text) {
+  if (authHint) authHint.textContent = text;
+}
+
+function authPayload(extra = {}) {
+  const selected = authBrowserSelect ? authBrowserSelect.value.trim() : "";
+  const profile = authProfileSelect ? authProfileSelect.value : "";
+  const cauth = authCauthInput ? authCauthInput.value.trim() : "";
+  if (cauth) {
+    return { ...extra, browser: "manual", cauth };
+  }
+  if (profile) {
+    return { ...extra, browser: "", profile };
+  }
+  return { ...extra, browser: selected };
+}
+
+function profileOptionLabel(profile) {
+  const label = profile.label || profile.folder;
+  const email = String(profile.email || "").trim();
+  const browserName = profile.browser.charAt(0).toUpperCase() + profile.browser.slice(1);
+  const details = [browserName];
+  if (profile.folder && profile.folder !== label) details.push(profile.folder);
+  const name = email && !label.toLowerCase().includes(email.toLowerCase()) ? `${label} · ${email}` : label;
+  return `${name} (${details.join(", ")})`;
+}
+
+async function loadBrowserProfiles(config) {
+  if (!authProfileSelect) return;
+  const savedProfile = (config && config.auth && config.auth.saved_profile) || "";
+  const remembered = localStorage.getItem(AUTH_PROFILE_STORAGE_KEY) || savedProfile;
+  let profiles = [];
+  try {
+    const data = await requestJson("/api/browser-profiles", { method: "POST", body: "{}" });
+    profiles = data.profiles || [];
+  } catch (error) {
+  }
+
+  authProfileSelect.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = profiles.length
+    ? "Auto-detect all browser profiles"
+    : "Auto-detect (no readable browser profiles found)";
+  authProfileSelect.append(auto);
+
+  profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.path;
+    option.textContent = profileOptionLabel(profile);
+    authProfileSelect.append(option);
+  });
+
+  if (remembered && profiles.some((profile) => profile.path === remembered)) {
+    authProfileSelect.value = remembered;
+  } else if (remembered && !profiles.length) {
+    // Keep the choice visible even if the profile list is unavailable right now.
+    const option = document.createElement("option");
+    option.value = remembered;
+    option.textContent = "Saved profile";
+    authProfileSelect.append(option);
+    authProfileSelect.value = remembered;
+  }
 }
 
 function isAuthDetectionFailure(message) {
@@ -382,8 +607,12 @@ function authButtonLabel(text, ok = null, userName = "") {
     return `Welcome, ${loggedInMatch[1].trim()}`;
   }
 
-  if (ok === true && /^logged in\.?$/i.test(message)) {
+  if (ok === true && /^logged in( as\s+.+?)?\.?(\s|$)/i.test(message)) {
     return "Welcome";
+  }
+
+  if (/could not auto-detect your coursera login/i.test(message)) {
+    return "Login not detected";
   }
 
   return message || "Login";
@@ -417,17 +646,305 @@ function restoreAuth() {
   return false;
 }
 
+const LOG_LEVEL_RANK = { debug: 0, info: 1, warning: 2, error: 3 };
+
+function logLevelName(entry) {
+  return String((entry && entry.level) || "INFO").toLowerCase();
+}
+
+function applyLogEntries(entries, resync) {
+  if (!entries || !entries.length) return;
+  if (resync) {
+    // The server dropped older lines; restart cleanly rather than leave a hole.
+    logEntries = [];
+    logHiddenBefore = 0;
+  }
+  entries.forEach((entry) => {
+    if (!entry || typeof entry.seq !== "number") return;
+    if (entry.seq <= logCursor) return;
+    logCursor = entry.seq;
+    logEntries.push(entry);
+  });
+  // Keep the browser responsive: an hour-long course can log 100k lines.
+  const MAX_VIEW = 5000;
+  if (logEntries.length > MAX_VIEW) {
+    const dropped = logEntries.length - MAX_VIEW;
+    logEntries = logEntries.slice(dropped);
+    logHiddenBefore += dropped;
+  }
+}
+
+function visibleLogEntries() {
+  const min = logLevelFilter ? logLevelFilter.value : "all";
+  if (min === "all") return logEntries;
+  const threshold = min === "info" ? 1 : min === "warning" ? 2 : 3;
+  return logEntries.filter((entry) => (LOG_LEVEL_RANK[logLevelName(entry)] || 1) >= threshold);
+}
+
+function renderLogStream() {
+  if (!logStream) return;
+  const entries = visibleLogEntries();
+  const total = logEntries.length + logHiddenBefore;
+  if (logCount) {
+    logCount.textContent = total
+      ? `${entries.length} of ${total} lines${logHiddenBefore ? " (older lines dropped)" : ""}`
+      : "";
+  }
+  if (!entries.length) {
+    logStream.innerHTML = `<div class="activity-note">${
+      total ? "No lines match this filter." : "No log lines yet."
+    }</div>`;
+    return;
+  }
+  logStream.innerHTML = entries
+    .map((entry) => {
+      const level = logLevelName(entry);
+      const time = entry.time ? `<span class="log-time">${escapeHtml(entry.time)}</span> ` : "";
+      return `<div class="log-line log-line-${level}">${time}${escapeHtml(entry.message || "")}</div>`;
+    })
+    .join("");
+  if (!logAutoScroll || logAutoScroll.checked) {
+    logStream.scrollTop = logStream.scrollHeight;
+  }
+}
+
+function syncLogPaneVisibility() {
+  // While a job streams lines, the raw log is the useful pane; the grouped tree
+  // detail is what the user wants once it has finished.
+  if (!logs || !logStream) return;
+  const streaming = logEntries.length > 0 && Boolean(currentStatus.running);
+  logs.hidden = streaming;
+  logStream.hidden = !streaming;
+}
+
+function formatBytesShort(value) {
+  const size = Number(value) || 0;
+  if (size <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
+  const scaled = size / Math.pow(1024, index);
+  return `${scaled.toFixed(scaled >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+let failedFilesDismissed = false;
+
+function renderFailedFiles(status) {
+  if (!failedFiles) return;
+  const failed = Array.isArray(status.failed_files) ? status.failed_files : [];
+  const retrying = Array.isArray(status.retrying_files) ? status.retrying_files : [];
+
+  // A note while automatic retries are in progress, so a temporary failure
+  // does not look like a permanent one.
+  if (jobRetryNote) {
+    if (retrying.length && !failed.length) {
+      jobRetryNote.hidden = false;
+      jobRetryNote.textContent = `Retrying ${retrying.length} file${
+        retrying.length === 1 ? "" : "s"
+      } automatically…`;
+    } else {
+      jobRetryNote.hidden = true;
+    }
+  }
+
+  if (!failed.length || failedFilesDismissed) {
+    failedFiles.hidden = true;
+    return;
+  }
+
+  failedFiles.hidden = false;
+  if (failedFilesTitle) {
+    failedFilesTitle.textContent = `${failed.length} file${
+      failed.length === 1 ? "" : "s"
+    } failed`;
+  }
+  failedFilesList.innerHTML = failed
+    .map((item) => {
+      const attempts = item.attempts ? ` — ${item.attempts} attempts` : "";
+      return `<li class="failed-file">
+        <span class="failed-file-name" title="${escapeHtml(item.filename || "")}">${escapeHtml(
+          item.name || item.filename || "unknown"
+        )}</span>
+        <span class="failed-file-reason">${escapeHtml(item.reason || "unknown error")}${attempts}</span>
+      </li>`;
+    })
+    .join("");
+}
+
+function renderProgress(status) {
+  if (!jobProgress) return;
+  const progress = status.progress || {};
+  const running = Boolean(status.running);
+  const paused = Boolean(status.paused);
+  const total = Number(progress.total) || 0;
+  const done = Number(progress.bytes) || 0;
+
+  // Per-file percentage while a file transfers, otherwise an indeterminate bar
+  // so the user can still see that work is happening.
+  const hasFileProgress = running && total > 0 && done > 0;
+  const percent = hasFileProgress ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  if (!running) {
+    jobProgress.hidden = true;
+    return;
+  }
+
+  jobProgress.hidden = false;
+  jobProgressTrack.classList.toggle("indeterminate", !hasFileProgress);
+  jobProgressTrack.setAttribute("aria-valuenow", String(hasFileProgress ? percent : 0));
+  jobProgressFill.style.width = hasFileProgress ? `${percent}%` : "35%";
+
+  const statusText = paused ? "Paused" : status.status === "canceling" ? "Canceling" : "Downloading";
+  jobProgressLabel.textContent = statusText;
+  jobProgressCount.textContent = hasFileProgress
+    ? `${percent}% — ${formatBytesShort(done)} of ${formatBytesShort(total)}`
+    : `${downloadCount} file${downloadCount === 1 ? "" : "s"} handled`;
+
+  if (progress.filename) {
+    const name = String(progress.filename).split(/[\\/]/).pop();
+    jobProgressFile.textContent = name;
+    jobProgressFile.title = progress.filename;
+  } else {
+    jobProgressFile.textContent = "";
+    jobProgressFile.title = "";
+  }
+
+  const parts = [];
+  if (progress.speed > 0) {
+    parts.push(`${formatBytesShort(progress.speed)}/s`);
+    if (hasFileProgress && progress.speed > 0) {
+      parts.push(`~${formatDuration((total - done) / progress.speed)} left`);
+    }
+  }
+  if (status.started_at) {
+    const elapsed = (status.finished_at || Date.now() / 1000) - status.started_at;
+    parts.push(`elapsed ${formatDuration(elapsed)}`);
+  }
+  jobProgressStats.textContent = parts.join(" · ");
+}
+
+let notifiedJobEnd = false;
+
+function notifyJobFinished(status) {
+  // Browser notifications only fire while this tab is open, which is exactly
+  // when the user is likely waiting on a long course download.
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const state = status.status || "";
+  if (status.running || !(state === "completed" || state === "failed")) return;
+  if (notifiedJobEnd) return;
+  notifiedJobEnd = true;
+
+  const failed = Array.isArray(status.failed_files) ? status.failed_files.length : 0;
+  if (state === "completed") {
+    const body = failed
+      ? `Finished with ${failed} file${failed === 1 ? "" : "s"} that could not be downloaded.`
+      : "All files downloaded successfully.";
+    new Notification("Coursera download finished", { body, tag: "coursera-download" });
+  } else {
+    new Notification("Coursera download failed", {
+      body: status.error || "See the log for details.",
+      tag: "coursera-download",
+    });
+  }
+}
+
+function renderQueue(status) {
+  if (!downloadQueue) return;
+  const queue = Array.isArray(status.queue) ? status.queue : [];
+  const runningCourse = status.current_course || "";
+  const show = queue.length > 0 || Boolean(runningCourse);
+  downloadQueue.hidden = !show;
+  if (!show) {
+    queueList.innerHTML = "";
+    return;
+  }
+  if (queueTitle) {
+    queueTitle.textContent = queue.length
+      ? `Queue (${queue.length} waiting)`
+      : "Queue";
+  }
+  if (queueCurrent) {
+    queueCurrent.hidden = !runningCourse;
+    queueCurrent.textContent = runningCourse ? `Downloading now: ${runningCourse}` : "";
+  }
+  queueList.innerHTML = queue
+    .map((entry, index) => {
+      const label = escapeHtml(queueCourseLabel(entry));
+      const sub = escapeHtml(entry.path || "");
+      const upDisabled = index === 0 ? " disabled" : "";
+      const downDisabled = index === queue.length - 1 ? " disabled" : "";
+      return `
+        <li class="queue-item" data-entry-id="${entry.id}">
+          <span class="queue-index">${index + 1}</span>
+          <span class="queue-text">
+            <span class="queue-name">${label}</span>
+            <span class="queue-path" title="${sub}">${sub}</span>
+          </span>
+          <span class="queue-item-actions">
+            <button type="button" class="secondary small queue-up" title="Move up"${upDisabled}>↑</button>
+            <button type="button" class="secondary small queue-down" title="Move down"${downDisabled}>↓</button>
+            <button type="button" class="secondary small queue-remove" title="Remove from queue">×</button>
+          </span>
+        </li>`;
+    })
+    .join("");
+  if (clearQueueBtn) clearQueueBtn.hidden = queue.length === 0;
+}
+
 function renderStatus(status) {
+  // Each queued run restarts the server's log numbering at 1. Without clearing
+  // the cursor here the second course's lines would all look "already seen"
+  // and the log pane would silently stay empty for the rest of the queue.
+  const previousJobSeq = currentStatus ? currentStatus.job_seq : undefined;
+  if (typeof status.job_seq === "number" && typeof previousJobSeq === "number" && status.job_seq !== previousJobSeq) {
+    logEntries = [];
+    logCursor = 0;
+    logHiddenBefore = 0;
+    notifiedJobEnd = false;
+  }
+  currentStatus = status;
   const state = status.status || "idle";
   jobState.textContent = state.charAt(0).toUpperCase() + state.slice(1);
   jobState.className = `status-pill ${state}`;
   setRunningState(Boolean(status.running), state);
 
-  if (status.logs && status.logs.length) {
-    renderGroupedLogs(status.logs);
-    logs.scrollTop = logs.scrollHeight;
-  } else if (status.error) {
-    logs.textContent = status.error;
+  // Append only the new log lines the server sent for this poll.
+  if (Array.isArray(status.log_entries)) {
+    applyLogEntries(status.log_entries, status.resync);
+    downloadCount = logEntries.filter((entry) =>
+      /^Downloading /.test(String(entry.message || "")) || /^Downloading: /.test(String(entry.message || ""))
+    ).length;
+  } else if (status.logs && status.logs.length) {
+    applyLogEntries(
+      status.logs.map((line, index) => ({ seq: logCursor + index + 1, time: "", message: String(line), level: "info" })),
+      false
+    );
+  }
+
+  renderProgress(status);
+  renderFailedFiles(status);
+  renderQueue(status);
+  updateDeleteButton();
+
+  // Reset the latch as soon as a new job starts so each run notifies once.
+  if (status.running) {
+    notifiedJobEnd = false;
+  } else {
+    notifyJobFinished(status);
+  }
+
+  renderLogStream();
+  syncLogPaneVisibility();
+  if (!logEntries.length && status.error) {
     activityTree.textContent = "Error";
   }
 
@@ -649,12 +1166,6 @@ function buildActivityGroups(lines) {
 function renderGroupedLogs(lines) {
   const groups = buildActivityGroups(lines);
   const hasRealCourseLogs = groups.some((group) => group.slug || group.title !== "Session");
-  console.debug("[tree-debug] renderGroupedLogs", {
-    logLines: lines.length,
-    parsedGroups: summarizeActivityGroups(groups),
-    downloadedGroups: summarizeActivityGroups(downloadedActivityGroups),
-    hasRealCourseLogs,
-  });
   if (!downloadedActivityGroups.length) {
     lastSessionLogGroups = groups;
     currentTreeNodes = [];
@@ -707,10 +1218,6 @@ function mergeDownloadedActivityGroups(groups) {
       merged.push(group);
     }
   });
-  console.debug("[tree-debug] mergeDownloadedActivityGroups", {
-    liveGroups: summarizeActivityGroups(groups),
-    mergedGroups: summarizeActivityGroups(merged),
-  });
   return merged;
 }
 
@@ -740,7 +1247,7 @@ function renderActivityGroups(groups, options = {}) {
     currentSidebarNodes = [];
     return;
   }
-  hideRecentCoursesLanding();
+  hideRecentCoursesLanding({ auto: true });
 
   currentTreeNodes = buildFolderTree(groups);
   currentSidebarNodes = currentTreeNodes.filter((node) => !isSessionNode(node));
@@ -761,23 +1268,6 @@ function renderActivityGroups(groups, options = {}) {
   activityTree.innerHTML = currentSidebarNodes.length
     ? renderTreeNodes(currentSidebarNodes)
     : "";
-  console.debug("[tree-debug] renderActivityGroups", {
-    sourceGroups: summarizeActivityGroups(groups),
-    sidebarNodes: summarizeTreeNodes(currentSidebarNodes),
-    selectedNode: summarizeTreeNode(findTreeNode(currentTreeNodes, selectedTreeId)),
-    selectedNodeChildren: (findTreeNode(currentTreeNodes, selectedTreeId)?.children || []).map(summarizeTreeNode),
-    roots: currentSidebarNodes.map((node) => ({
-      id: node.id,
-      title: node.title,
-      children: node.children.length,
-      files: nodeFileCount(node),
-      expected: node.expectedCount,
-      active: node.active,
-    })),
-    selectedTreeId,
-    activeTreeId,
-    expandedCount: expandedTreeIds.size,
-  });
   renderSelectedTreeNode();
 }
 
@@ -1162,24 +1652,103 @@ function statusText(status, fileCount = null) {
   if (status === "canceling") return "Canceling";
   if (status === "canceled") return "Canceled";
   if (status === "failed") return "Failed";
-  if (status === "manifest-missing") return "Manifest missing";
+  // "manifest-missing" is only kept for older servers: a downloaded course
+  // reports "downloaded" from the folder scan, so this label should never
+  // appear for a course that is actually on disk.
+  if (status === "manifest-missing") return "Downloaded (no manifest)";
   if (status === "manifest") return "Loading…";
   if (status === "pending") return "Loading…";
   if (status === "running") return "Running";
   return "Running";
 }
 
+const STATUS_POLL_ACTIVE_MS = 700;
+const STATUS_POLL_IDLE_MS = 2500;
+
+function startStatusPolling() {
+  // Poll quickly while work is happening so progress looks live, and back off
+  // when idle instead of hammering the server forever.
+  if (statusTimer) {
+    clearInterval(statusTimer);
+  }
+  const delay = currentStatus && currentStatus.running ? STATUS_POLL_ACTIVE_MS : STATUS_POLL_IDLE_MS;
+  statusTimer = setInterval(refreshStatus, delay);
+}
+
 async function refreshStatus() {
-  const status = await requestJson("/api/status");
+  // Ask only for entries after our cursor: keeps each poll small during a
+  // multi-hour download instead of resending thousands of lines every time.
+  const status = await requestJson(`/api/status?since=${logCursor}`);
   renderStatus(status);
   if (status.running) {
     await updateDownloadState({ force: true, render: treeNeedsStateRender() });
   }
   if (!status.running && statusTimer) {
+    // Keep polling slowly so the last lines and the final status still land,
+    // but stop the moment the job is over and nothing is left to stream.
     clearInterval(statusTimer);
-    statusTimer = null;
+    statusTimer = setInterval(refreshStatus, STATUS_POLL_IDLE_MS);
     await updateDownloadState({ render: !(status.logs && status.logs.length) });
   }
+}
+
+function requestNotificationPermission() {
+  try {
+    if ("Notification" in window && Notification.permission === "default") {
+      void Notification.requestPermission();
+    }
+  } catch {
+    /* not supported in this browser */
+  }
+}
+
+function queueCourseLabel(entry) {
+  return entry.class_name || entry.course || "Course";
+}
+
+async function enqueueCurrentCourse() {
+  const payload = authPayload(payloadFromForm());
+  if (!String(payload.course || "").trim()) {
+    showMessage("Paste a course URL first.");
+    return;
+  }
+  const endpoint = canResumeCurrentCourse ? "/api/queue-resume" : "/api/queue";
+  const result = await requestJson(endpoint, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  renderStatus(result.status);
+  showMessage("Added to the queue. It starts automatically when the current download finishes.", true);
+  hideRecentCoursesLanding();
+  // Only the input is cleared. The tree and log still belong to the course that
+  // is downloading right now, so they must not be reset here.
+  courseInput.value = "";
+  localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  updateClearButtonVisibility();
+  hideCourseHistory();
+}
+
+async function removeQueueEntry(entryId) {
+  const result = await requestJson("/api/queue-remove", {
+    method: "POST",
+    body: JSON.stringify({ entry_id: entryId }),
+  });
+  renderStatus(result.status);
+  showMessage("Removed from the queue.", true);
+}
+
+async function moveQueueEntry(entryId, offset) {
+  const result = await requestJson("/api/queue-move", {
+    method: "POST",
+    body: JSON.stringify({ entry_id: entryId, offset }),
+  });
+  renderStatus(result.status);
+}
+
+async function clearQueue() {
+  const result = await requestJson("/api/queue-clear", { method: "POST", body: "{}" });
+  renderStatus(result.status);
+  showMessage("Queue cleared.", true);
 }
 
 async function startDownload(endpoint) {
@@ -1189,14 +1758,16 @@ async function startDownload(endpoint) {
   expandedTreeIds.clear();
   const result = await requestJson(endpoint, {
     method: "POST",
-    body: JSON.stringify(payloadFromForm()),
+    body: JSON.stringify(authPayload(payloadFromForm())),
   });
   rememberCourseInput();
   renderStatus(result.status);
   showMessage(`${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`, true);
-  if (!statusTimer) {
-    statusTimer = setInterval(refreshStatus, 1500);
-  }
+  // An explicit download is a hard exit from the list view; the auto-guard the
+  // poll uses must not keep the user on it.
+  hideRecentCoursesLanding();
+  requestNotificationPermission();
+  startStatusPolling();
   await updateDownloadState({ force: true });
 }
 
@@ -1240,7 +1811,6 @@ async function performDownloadStateUpdate(options = {}) {
           }
         }
       } catch (quickError) {
-        console.debug("[tree-debug] quick state failed", quickError);
       }
     }
     const state = await requestJson("/api/download-state", {
@@ -1248,26 +1818,20 @@ async function performDownloadStateUpdate(options = {}) {
       body: JSON.stringify(payloadFromForm()),
     });
     canResumeCurrentCourse = Boolean(state.can_resume);
+    currentCourseFolder = state.course_folder || "";
+    currentCourseName = state.class_name || "";
+    updateDeleteButton();
     if (state.resume_path && pathInput.value !== state.resume_path) {
       pathInput.value = state.resume_path;
     }
     if (Array.isArray(state.activity_groups) && state.activity_groups.length) {
       downloadedActivityGroups = state.activity_groups;
-      console.debug("[tree-debug] updateDownloadState", {
-        canResume: state.can_resume,
-        className: state.class_name,
-        courseFolder: state.course_folder,
-        groups: summarizeActivityGroups(state.activity_groups),
-        running: currentStatus.running,
-        shouldRender,
-      });
       const treeIsPlaceholder = treeNeedsStateRender();
       if ((!currentStatus.running && shouldRender) || treeIsPlaceholder) {
         renderActivityGroups(state.activity_groups);
       }
     }
   } catch (error) {
-    console.debug("[tree-debug] updateDownloadState failed", error);
     canResumeCurrentCourse = false;
   }
   refreshDownloadButton();
@@ -1278,13 +1842,11 @@ async function startItemDownload(action, item) {
   const endpoint = action === "resume" ? "/api/resume-item" : "/api/download-item";
   const result = await requestJson(endpoint, {
     method: "POST",
-    body: JSON.stringify({ ...payloadFromForm(), item }),
+    body: JSON.stringify(authPayload({ ...payloadFromForm(), item })),
   });
   renderStatus(result.status);
   showMessage(`${action === "resume" ? "Resume" : "Retry"} started for ${item.type}.`, true);
-  if (!statusTimer) {
-    statusTimer = setInterval(refreshStatus, 1500);
-  }
+  startStatusPolling();
 }
 
 async function controlDownload(endpoint, message) {
@@ -1293,7 +1855,54 @@ async function controlDownload(endpoint, message) {
   renderStatus(result.status);
   showMessage(message, true);
   if (!statusTimer && result.status.running) {
-    statusTimer = setInterval(refreshStatus, 1500);
+    startStatusPolling();
+  }
+}
+
+function restoreAuthBrowser(config) {
+  const stored = localStorage.getItem(AUTH_BROWSER_STORAGE_KEY) || "";
+  if (authBrowserSelect && stored && [...authBrowserSelect.options].some((option) => option.value === stored)) {
+    authBrowserSelect.value = stored;
+  }
+  if (authHint && config && config.auth && config.auth.has_saved_cauth) {
+    authHint.textContent = "A CAUTH cookie is already saved. Paste a new one below only if the login expires.";
+  }
+}
+
+async function applyAuthChoice() {
+  const payload = authPayload();
+  authApplyBtn.disabled = true;
+  loginCheckBtn.disabled = true;
+  clearMessage();
+  try {
+    const result = await requestJson("/api/save-cauth", { method: "POST", body: JSON.stringify(payload) });
+    setAuthMessage(result.message, result.authenticated, result.user_name);
+    if (result.authenticated) {
+      rememberAuth(result);
+      if (payload.profile) {
+        localStorage.setItem(AUTH_PROFILE_STORAGE_KEY, payload.profile);
+      } else if (payload.browser && payload.browser !== "manual") {
+        localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, payload.browser);
+      }
+      if (payload.cauth && authCauthInput) {
+        authCauthInput.value = "";
+      }
+      showMessage(result.message, true);
+      setAuthHint(result.profile_label
+        ? `Signed in via ${result.browser} profile "${result.profile_label}".`
+        : `Signed in via ${result.browser || "auto-detect"}.`);
+    } else {
+      // The attempt failed, so any earlier "Signed in via ..." line is stale and
+      // contradicts the error above it. Replace it with the real reason.
+      const failure = result.message || AUTH_HINT_MESSAGE;
+      showMessage(failure);
+      setAuthHint(failure);
+    }
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    authApplyBtn.disabled = false;
+    loginCheckBtn.disabled = false;
   }
 }
 
@@ -1322,26 +1931,49 @@ async function init() {
     resolutionInput.checked = true;
   }
 
+  restoreAuthBrowser(config);
+  await loadBrowserProfiles(config);
   const initialDownloadState = updateDownloadState({ force: true, render: true });
   await refreshStatus();
   await initialDownloadState;
-  await checkAuthOnce(false);
+  // Startup shows the hint in the log so it is obvious why downloads may fail;
+  // polling later stays quiet.
+  await checkAuthOnce(true);
 }
 
 async function checkAuthOnce(showResult = true) {
   if (!authCheckPromise) {
-    authCheckPromise = requestJson("/api/check-auth", { method: "POST", body: "{}" })
+    authCheckPromise = requestJson("/api/check-auth", {
+      method: "POST",
+      body: JSON.stringify(authPayload()),
+    })
       .finally(() => {
         authCheckPromise = null;
       });
   }
   const result = await authCheckPromise;
-  setAuthMessage(result.message, result.authenticated, result.user_name);
-  if (result.authenticated) {
+  if (!result.authenticated) {
+    // "Login not detected" is an informative state, not an error: it is the
+    // normal outcome before the user signs in. Drop any stale success hint so
+    // it cannot contradict the banner.
+    setAuthMessage(result.message, null, "");
+    setAuthHint(result.message);
+  } else {
+    setAuthMessage(result.message, true, result.user_name);
     rememberAuth(result);
+    const sourceLabel = result.browser === "manual"
+      ? "the saved CAUTH cookie"
+      : result.profile_label
+        ? `${result.browser} profile "${result.profile_label}"`
+        : result.browser || "auto-detect";
+    setAuthHint(`Signed in via ${sourceLabel}.`);
   }
-  if (showResult && !result.authenticated && !isAuthDetectionFailure(result.message)) {
-    showMessage(result.message, result.authenticated);
+  if (showResult && !result.authenticated) {
+    if (isAuthDetectionFailure(result.message)) {
+      showMessage(authFailureMessage(result));
+    } else {
+      showMessage(result.message, result.authenticated);
+    }
   }
   await refreshStatus();
   return result;
@@ -1383,12 +2015,10 @@ form.addEventListener("submit", async (event) => {
   addToCourseHistory(courseInput.value);
   hideCourseHistory();
   try {
+    // While a course is downloading, a pasted link joins the queue - it does
+    // not pause the current download and it is not rejected.
     if (currentStatus.running) {
-      const paused = currentStatus.status === "paused";
-      await controlDownload(
-        paused ? "/api/resume-job" : "/api/pause",
-        paused ? "Download resumed." : "Download paused."
-      );
+      await enqueueCurrentCourse();
       return;
     }
 
@@ -1415,7 +2045,9 @@ courseInput.addEventListener("input", () => {
   renderCourseHistory();
   if (courseInput.value.trim()) {
     hideRecentCoursesLanding();
-  } else if (!downloadedActivityGroups.length) {
+  } else if (!downloadedActivityGroups.length && !showingCourseLanding) {
+    // Only fall back to the list when there is no course being viewed; an empty
+    // input while browsing the list must not re-render it on every keystroke.
     showRecentCoursesLanding();
   }
 });
@@ -1427,6 +2059,27 @@ if (courseClearBtn) {
   });
 }
 
+function goBackToCourses() {
+  // Leaving the detail view drops the course selection so the landing list is
+  // the single source of truth again. The tree/log are rebuilt from the folder
+  // if the course is picked again, so nothing is lost by clearing them.
+  courseInput.value = "";
+  localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  hideCourseHistory();
+  downloadedActivityGroups = [];
+  lastSessionLogGroups = [];
+  currentTreeNodes = [];
+  currentSidebarNodes = [];
+  selectedTreeId = "";
+  canResumeCurrentCourse = false;
+  updateClearButtonVisibility();
+  if (recentCoursesSection) recentCoursesSection.hidden = true;
+  if (activityBody) activityBody.hidden = true;
+  showRecentCoursesLanding();
+  const heading = document.querySelector("#recentCoursesHeading");
+  if (heading) heading.focus();
+}
+
 function pickRecentCourse(url) {
   if (!url) return;
   courseInput.value = url;
@@ -1435,7 +2088,15 @@ function pickRecentCourse(url) {
   updateClearButtonVisibility();
   hideCourseHistory();
   hideRecentCoursesLanding();
+  updateBackButton();
   void updateDownloadState({ force: true, render: true });
+}
+
+if (backToCoursesBtn) {
+  backToCoursesBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    goBackToCourses();
+  });
 }
 
 document.addEventListener("click", (event) => {
@@ -1508,6 +2169,51 @@ document.addEventListener("click", (event) => {
     return;
   }
 });
+
+if (pauseBtn) {
+  pauseBtn.addEventListener("click", async () => {
+    const paused = currentStatus && currentStatus.status === "paused";
+    try {
+      await controlDownload(
+        paused ? "/api/resume-job" : "/api/pause",
+        paused ? "Download resumed." : "Download paused."
+      );
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (clearQueueBtn) {
+  clearQueueBtn.addEventListener("click", async () => {
+    try {
+      await clearQueue();
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (queueList) {
+  queueList.addEventListener("click", async (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    const item = button.closest(".queue-item");
+    if (!item) return;
+    const entryId = Number(item.dataset.entryId);
+    try {
+      if (button.classList.contains("queue-remove")) {
+        await removeQueueEntry(entryId);
+      } else if (button.classList.contains("queue-up")) {
+        await moveQueueEntry(entryId, -1);
+      } else if (button.classList.contains("queue-down")) {
+        await moveQueueEntry(entryId, 1);
+      }
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
 
 refreshBtn.addEventListener("click", async () => {
   try {
@@ -1604,6 +2310,40 @@ function scheduleDownloadStateUpdate() {
 courseInput.addEventListener("input", scheduleDownloadStateUpdate);
 pathInput.addEventListener("input", scheduleDownloadStateUpdate);
 
+const THEME_STORAGE_KEY = "courseraDownloader.theme";
+
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === "dark") {
+    root.setAttribute("data-theme", "dark");
+  } else {
+    root.removeAttribute("data-theme");
+  }
+  if (themeToggleBtn) {
+    const label = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+    themeToggleBtn.setAttribute("aria-label", label);
+    themeToggleBtn.title = label;
+    themeToggleBtn.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+  }
+}
+
+if (themeToggleBtn) {
+  applyTheme(currentTheme());
+  themeToggleBtn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    applyTheme(next);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch {
+      /* private mode: the theme just will not persist */
+    }
+  });
+}
+
 settingsToggleBtn.addEventListener("click", () => {
   setSettingsVisible(settingsPanel.hasAttribute("hidden"), true);
 });
@@ -1625,6 +2365,173 @@ activityTree.addEventListener("click", (event) => {
   renderSelectedTreeNode();
 });
 
+function updateDeleteButton() {
+  const hasCourse = Boolean(currentCourseFolder);
+  const running = Boolean(currentStatus && currentStatus.running);
+  const failedCount = Array.isArray(currentStatus.failed_files)
+    ? currentStatus.failed_files.length
+    : 0;
+
+  if (deleteCourseBtn) {
+    deleteCourseBtn.hidden = !hasCourse;
+    if (hasCourse) {
+      deleteCourseBtn.title = running
+        ? "Stops the running download, then deletes this course folder"
+        : "Delete this course folder from disk";
+    }
+  }
+  if (openCourseBtn) {
+    // Opening the folder is useful even while downloading.
+    openCourseBtn.hidden = !hasCourse;
+  }
+  if (retryCourseBtn) {
+    const show = hasCourse && !running && (canResumeCurrentCourse || failedCount > 0);
+    retryCourseBtn.hidden = !show;
+    if (show) {
+      retryCourseBtn.title = failedCount
+        ? `Retry the ${failedCount} failed file${failedCount === 1 ? "" : "s"} plus anything missing`
+        : "Re-run this course; only missing or failed files download";
+    }
+  }
+}
+
+function formatBytesForDialog(bytes) {
+  const size = Number(bytes) || 0;
+  if (size <= 0) return "0 bytes";
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
+  return `${(size / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+async function deleteCourse() {
+  if (!currentCourseFolder) return;
+  const payload = {
+    course: courseInput.value.trim(),
+    path: pathInput.value.trim(),
+    course_folder: currentCourseFolder,
+  };
+
+  // Ask the server what will be removed before doing anything destructive.
+  let info;
+  try {
+    info = await requestJson("/api/course-delete-info", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    showMessage(error.message);
+    return;
+  }
+  if (!info.allowed) {
+    showMessage(info.reason || "This folder cannot be deleted.");
+    return;
+  }
+
+  const running = Boolean(info.is_running);
+  const lines = [
+    `Delete "${currentCourseName || "this course"}"?`,
+    "",
+    `Folder: ${info.folder}`,
+    `Contents: ${info.files} file${info.files === 1 ? "" : "s"} (${formatBytesForDialog(info.bytes)})`,
+    "",
+  ];
+  if (running) {
+    lines.push("A download is running for this course. It will be stopped first.");
+  } else {
+    lines.push("This permanently removes the downloaded files from disk.");
+  }
+  if (!window.confirm(lines.join("\n"))) return;
+
+  deleteCourseBtn.disabled = true;
+  try {
+    const result = await requestJson("/api/delete-course", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    currentCourseFolder = "";
+    downloadedActivityGroups = [];
+    updateDeleteButton();
+    renderStatus(result.status || { running: false, status: "idle" });
+    showMessage(
+      `Deleted ${result.files} file${result.files === 1 ? "" : "s"}${
+        result.stopped_download ? " after stopping the download" : ""
+      }.`,
+      true
+    );
+    await updateDownloadState({ force: true, render: true });
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    deleteCourseBtn.disabled = false;
+  }
+}
+
+if (openCourseBtn) {
+  openCourseBtn.addEventListener("click", async () => {
+    if (!currentCourseFolder) return;
+    try {
+      await requestJson("/api/open-path", {
+        method: "POST",
+        body: JSON.stringify({ path: currentCourseFolder }),
+      });
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (retryCourseBtn) {
+  retryCourseBtn.addEventListener("click", async () => {
+    retryCourseBtn.disabled = true;
+    try {
+      // --resume makes the workflow skip complete files and re-download only
+      // those with a .partial marker (i.e. the ones that failed).
+      await startDownload("/api/resume");
+    } catch (error) {
+      showMessage(error.message);
+    } finally {
+      retryCourseBtn.disabled = false;
+    }
+  });
+}
+
+if (retryFailedBtn) {
+  retryFailedBtn.addEventListener("click", async () => {
+    retryFailedBtn.disabled = true;
+    try {
+      const result = await requestJson("/api/retry-failed", {
+        method: "POST",
+        body: "{}",
+      });
+      if (!result.ok) {
+        showMessage(result.reason || "Nothing to retry.");
+        return;
+      }
+      failedFilesDismissed = false;
+      showMessage(`Retrying ${result.count} failed file${result.count === 1 ? "" : "s"}…`, true);
+      renderStatus(result.status);
+      startStatusPolling();
+    } catch (error) {
+      showMessage(error.message);
+    } finally {
+      retryFailedBtn.disabled = false;
+    }
+  });
+}
+
+if (dismissFailedBtn) {
+  dismissFailedBtn.addEventListener("click", () => {
+    failedFilesDismissed = true;
+    renderFailedFiles(currentStatus);
+  });
+}
+
+if (deleteCourseBtn) {
+  deleteCourseBtn.addEventListener("click", () => {
+    void deleteCourse();
+  });
+}
+
 expandTreeBtn.addEventListener("click", () => {
   userChangedExpansion = true;
   expandAllTreeNodes();
@@ -1636,6 +2543,75 @@ collapseTreeBtn.addEventListener("click", () => {
   collapseAllTreeNodes();
   renderSelectedTreeNode();
 });
+
+if (authApplyBtn) {
+  if (logLevelFilter) {
+    logLevelFilter.addEventListener("change", () => {
+      localStorage.setItem("courseraDownloader.logLevel", logLevelFilter.value);
+      renderLogStream();
+    });
+  }
+  if (logCopyBtn) {
+    logCopyBtn.addEventListener("click", async () => {
+      const text = visibleLogEntries()
+        .map((entry) => `[${entry.time || ""}] ${entry.message || ""}`)
+        .join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        logCopyBtn.textContent = "Copied";
+        setTimeout(() => {
+          logCopyBtn.textContent = "Copy";
+        }, 1400);
+      } catch {
+        // Clipboard can be blocked; fall back to selecting the text.
+        logStream.focus();
+        showMessage("Could not copy automatically. Select the log text and copy it manually.");
+      }
+    });
+  }
+  if (logClearBtn) {
+    logClearBtn.addEventListener("click", () => {
+      // Only the view is cleared; logCursor stays so the server keeps sending
+      // anything new, and nothing is lost from the download itself.
+      logEntries = [];
+      logHiddenBefore = 0;
+      renderLogStream();
+    });
+  }
+  if (logAutoScroll) {
+    logAutoScroll.addEventListener("change", () => {
+      localStorage.setItem("courseraDownloader.logAutoScroll", logAutoScroll.checked ? "1" : "0");
+    });
+  }
+
+  authApplyBtn.addEventListener("click", () => {
+    void applyAuthChoice();
+  });
+}
+
+if (authBrowserSelect) {
+  authBrowserSelect.addEventListener("change", () => {
+    localStorage.setItem(AUTH_BROWSER_STORAGE_KEY, authBrowserSelect.value);
+  });
+}
+
+if (authProfileSelect) {
+  authProfileSelect.addEventListener("change", () => {
+    localStorage.setItem(AUTH_PROFILE_STORAGE_KEY, authProfileSelect.value);
+  });
+}
+
+if (authRefreshBtn) {
+  authRefreshBtn.addEventListener("click", async () => {
+    authRefreshBtn.disabled = true;
+    try {
+      await loadBrowserProfiles(null);
+      showMessage("Browser profiles refreshed.", true);
+    } finally {
+      authRefreshBtn.disabled = false;
+    }
+  });
+}
 
 loginCheckBtn.addEventListener("click", async () => {
   clearMessage();
@@ -1654,6 +2630,7 @@ loginCheckBtn.addEventListener("click", async () => {
       setAuthMessage("Checking login...", null);
       await refreshStatus();
       startAuthPolling();
+      showMessage(cleanDisplayMessage(AUTH_HINT_MESSAGE));
       return;
     }
 
