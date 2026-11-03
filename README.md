@@ -77,10 +77,13 @@ Open the **Anaconda Prompt** from the Start menu (not the plain `cmd` window, wh
 ```bat
 conda create -n coursera_env python=3.10 -y
 conda activate coursera_env
-cd /d C:\Users\<you>\Desktop\Coursera-Downloader
-pip install -r requirements.txt
+cd /d C:\Users\<you>\Desktop\coursera\coursera-downloader
+python -m pip install -r requirements.txt
 start_web_app.bat
 ```
+
+Only the first two commands are one-time setup. On every later run you just need
+`conda activate coursera_env`, the `cd`, and `start_web_app.bat`.
 
 The launcher prints `Using conda environment coursera_env:` followed by the interpreter path, so you can confirm your environment is the one running. Then open <http://localhost:7500>.
 
@@ -96,6 +99,17 @@ Notes:
 - You do **not** need to create a `.venv`. If an old `.venv` folder is left in the project, an activated conda environment still takes priority.
 - Keep the console window open while downloading; it is the app's server.
 - To leave the environment later: `conda deactivate`.
+
+#### If something goes wrong
+
+| Symptom | Fix |
+|---|---|
+| `'conda' is not recognized` | You are in `cmd`. Open **Anaconda Prompt** instead. |
+| `activate` does nothing / wrong Python | Run `conda activate coursera_env` again and check the prompt shows `(coursera_env)`. |
+| `ModuleNotFoundError` on start | Dependencies went into a different Python. Re-run `python -m pip install -r requirements.txt` **after** activating. |
+| Port 7500 already in use | An earlier instance is still running. Close its console window, or run `python web_app.py --port 7501`. |
+| Browser shows an old UI after updating | Press `Ctrl+Shift+R` to bypass the cached CSS/JS. |
+| `pip` is slow or fails | `python -m pip install --upgrade pip` then retry, or add `-i https://pypi.org/simple`. |
 
 # Usage
 
