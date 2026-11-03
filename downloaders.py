@@ -12,14 +12,61 @@ from __future__ import print_function
 import logging
 import math
 import os
+import random
 import subprocess
 import sys
+import threading
 import time
 
 import requests
 
 _cancel_event = None
 _pause_event = None
+
+# Optional throttle in bytes/second (0 = unlimited). Shared by all workers, so
+# setting it caps the whole course rather than each file.
+_speed_limit = 0
+_speed_lock = threading.Lock()
+_speed_window = {'start': 0.0, 'bytes': 0}
+
+
+def set_speed_limit(bytes_per_second):
+    global _speed_limit
+    with _speed_lock:
+        _speed_limit = max(0, int(bytes_per_second or 0))
+        _speed_window['start'] = 0.0
+        _speed_window['bytes'] = 0
+
+
+def get_speed_limit():
+    return _speed_limit
+
+
+def _throttle(chunk_bytes):
+    """Sleep just enough to keep the aggregate rate under the limit.
+
+    This is a cumulative budget: after `chunk_bytes` the total transferred must
+    not exceed limit * elapsed. The overshoot is the exact time to wait, which
+    keeps the average rate accurate without per-chunk bookkeeping windows.
+    """
+    if _speed_limit <= 0:
+        return
+    with _speed_lock:
+        now = time.time()
+        if _speed_window['start'] <= 0:
+            _speed_window['start'] = now
+        _speed_window['bytes'] += chunk_bytes
+        elapsed = max(now - _speed_window['start'], 1e-6)
+        allowed = _speed_limit * elapsed
+        over = _speed_window['bytes'] - allowed
+        sleep_for = (over / float(_speed_limit)) if over > 0 else 0.0
+    if sleep_for <= 0:
+        return
+    # Sleep in slices so cancel stays responsive on a slow connection.
+    deadline = time.time() + sleep_for
+    while time.time() < deadline:
+        raise_if_cancelled()
+        time.sleep(min(0.1, max(0.0, deadline - time.time())))
 
 
 class DownloadCancelled(BaseException):
@@ -317,6 +364,52 @@ def _publish_progress(filename, url, done, total, started_at):
         PROGRESS['percent'] = 0
 
 
+# Per-file download outcomes, so the UI can show which files failed and offer a
+# targeted retry instead of re-running the whole course.
+FILE_STATUS = {}
+
+
+def _file_key(filename):
+    try:
+        return os.path.abspath(str(filename))
+    except (TypeError, ValueError):
+        return str(filename)
+
+
+def note_download_failure(filename, reason, attempts, retrying=False):
+    key = _file_key(filename)
+    entry = FILE_STATUS.get(key) or {
+        'filename': key,
+        'name': os.path.basename(key),
+        'attempts': 0,
+        'retrying': False,
+        'failed': False,
+        'reason': '',
+    }
+    entry['attempts'] = attempts
+    entry['retrying'] = bool(retrying)
+    entry['failed'] = not retrying
+    entry['reason'] = str(reason or '')
+    FILE_STATUS[key] = entry
+
+
+def clear_download_failure(filename):
+    FILE_STATUS.pop(_file_key(filename), None)
+
+
+def reset_file_status():
+    FILE_STATUS.clear()
+
+
+def failed_files():
+    """Files that exhausted their retries, newest first."""
+    return [dict(item) for item in FILE_STATUS.values() if item.get('failed')]
+
+
+def retrying_files():
+    return [dict(item) for item in FILE_STATUS.values() if item.get('retrying')]
+
+
 class DownloadProgress(object):
     """
     Report download progress.
@@ -389,106 +482,200 @@ class DownloadProgress(object):
 
 class NativeDownloader(Downloader):
     """
-    'Native' python downloader -- slower than the external downloaders.
+    'Native' python downloader.
+
+    Retries are per file: a dropped connection, a timeout or a truncated body
+    resumes *that* file and leaves every other download running. The previous
+    version only retried HTTP error codes, so any network exception during the
+    body escalated out of download_modules and aborted the whole course.
 
     :param session: Requests session.
     """
 
+    #: Attempts per file, including the first one.
+    MAX_ATTEMPTS = 4
+    #: (connect, read) timeout in seconds. A stalled socket must not hang for ever.
+    TIMEOUT = (15, 60)
+    #: First backoff delay; doubles each attempt, capped by MAX_BACKOFF.
+    BASE_BACKOFF = 1.0
+    MAX_BACKOFF = 30.0
+
+    # HTTP statuses worth retrying: transient server and throttling responses.
+    RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
     def __init__(self, session):
         self.session = session
 
+    # -- helpers -----------------------------------------------------------
+    @classmethod
+    def backoff_delay(cls, attempt):
+        """Exponential backoff with jitter, so a fleet of workers does not sync."""
+        delay = min(cls.MAX_BACKOFF, cls.BASE_BACKOFF * (2 ** max(0, attempt - 1)))
+        return delay + random.uniform(0, delay * 0.25)
+
+    @staticmethod
+    def _is_retryable_exception(exc):
+        if isinstance(exc, (requests.exceptions.SSLError,)):
+            return False
+        return isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ContentDecodingError,
+                requests.exceptions.RequestException,
+                OSError,
+            ),
+        )
+
+    def _sleep_before_retry(self, attempt, reason, filename):
+        delay = self.backoff_delay(attempt)
+        note_download_failure(filename, reason, attempt, retrying=True)
+        logging.warning(
+            'Retrying %s in %.1fs (attempt %d/%d): %s',
+            os.path.basename(filename), delay, attempt + 1, self.MAX_ATTEMPTS, reason,
+        )
+        # Sleep in small slices so cancel and pause stay responsive.
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            raise_if_cancelled()
+            wait_if_paused()
+            time.sleep(0.1)
+
     def _start_download(self, url, filename, resume=False):
-        # resume has no meaning if the file doesn't exists!
+        # resume has no meaning if the file does not exist!
         resume = resume and os.path.exists(filename)
 
-        headers = {}
-        filesize = None
         if resume:
-            filesize = os.path.getsize(filename)
-            headers['Range'] = 'bytes={}-'.format(filesize)
             logging.info('Resume downloading %s -> %s', url, filename)
         else:
             logging.info('Downloading %s -> %s', url, filename)
 
-        max_attempts = 3
-        attempts_count = 0
         error_msg = ''
-        while attempts_count < max_attempts:
+        attempt = 0
+
+        while attempt < self.MAX_ATTEMPTS:
+            attempt += 1
             raise_if_cancelled()
             wait_if_paused()
-            r = self.session.get(url, stream=True, headers=headers)
 
-            if r.status_code != 200:
-                # because in resume state we are downloading only a
-                # portion of requested file, server may return
-                # following HTTP codes:
-                # 206: Partial Content
-                # 416: Requested Range Not Satisfiable
-                # which are OK for us.
-                if resume and r.status_code == 206:
-                    pass
-                elif resume and r.status_code == 416:
-                    logging.info('%s already downloaded', filename)
-                    r.close()
-                    return True
-                else:
-                    print('%s %s %s' % (r.status_code, url, filesize))
-                    logging.warn('Probably the file is missing from the AWS '
-                                 'repository...  waiting.')
-
-                    if r.reason:
-                        error_msg = r.reason + ' ' + str(r.status_code)
-                    else:
-                        error_msg = 'HTTP Error ' + str(r.status_code)
-
-                    wait_interval = 2 ** (attempts_count + 1)
-                    msg = 'Error downloading, will retry in {0} seconds ...'
-                    print(msg.format(wait_interval))
-                    time.sleep(wait_interval)
-                    attempts_count += 1
-                    continue
-
-            if resume and r.status_code == 200:
-                # if the server returns HTTP code 200 while we are in
-                # resume mode, it means that the server does not support
-                # partial downloads.
+            # Resume from whatever is already on disk on every attempt, so a
+            # retry after a mid-body failure does not start the file over.
+            filesize = os.path.getsize(filename) if os.path.exists(filename) else 0
+            headers = {}
+            if filesize:
+                headers['Range'] = 'bytes=%d-' % filesize
+                resume = True
+            else:
                 resume = False
 
-            content_length = r.headers.get('content-length')
-            chunk_sz = 1048576
-            progress = DownloadProgress(content_length)
-            progress.start()
-            started_at = time.time()
-            base_offset = filesize if (resume and filesize) else 0
-            expected_total = (int(content_length) + base_offset) if content_length else 0
-            f = open(filename, 'ab') if resume else open(filename, 'wb')
             try:
-                while True:
-                    raise_if_cancelled()
-                    wait_if_paused()
-                    data = r.raw.read(chunk_sz, decode_content=True)
-                    if not data:
-                        progress.stop()
-                        break
-                    progress.report(r.raw.tell())
-                    _publish_progress(
-                        filename, url,
-                        base_offset + r.raw.tell(),
-                        expected_total,
-                        started_at,
-                    )
-                    f.write(data)
-            finally:
-                f.close()
-                r.close()
-                PROGRESS['active'] = False
-                PROGRESS['percent'] = 100 if expected_total else PROGRESS['percent']
-            return True
+                return self._attempt_download(
+                    url, filename, headers, filesize, resume, attempt
+                )
+            except DownloadCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - every failure is per file
+                if isinstance(exc, requests.exceptions.HTTPError):
+                    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                    if status is not None and status not in self.RETRY_STATUSES:
+                        # 404 and friends will not fix themselves.
+                        logging.error('Giving up on %s: HTTP %s', url, status)
+                        note_download_failure(filename, 'HTTP %s' % status, attempt)
+                        return False
+                if not self._is_retryable_exception(exc) and not isinstance(
+                    exc, requests.exceptions.HTTPError
+                ):
+                    logging.error('Giving up on %s: %s', url, exc)
+                    note_download_failure(filename, str(exc), attempt)
+                    return False
 
-        if attempts_count == max_attempts:
-            logging.warn('Skipping, can\'t download file ...')
-            logging.error(error_msg)
-            return False
+                error_msg = str(exc) or exc.__class__.__name__
+                if attempt >= self.MAX_ATTEMPTS:
+                    break
+                self._sleep_before_retry(attempt, error_msg, filename)
+
+        logging.error('Skipping %s after %d attempts: %s', url, self.MAX_ATTEMPTS, error_msg)
+        note_download_failure(filename, error_msg, self.MAX_ATTEMPTS)
+        return False
+
+    def _attempt_download(self, url, filename, headers, filesize, resume, attempt):
+        """One attempt. Raises on any transient problem so the caller retries."""
+        r = self.session.get(url, stream=True, headers=headers, timeout=self.TIMEOUT)
+
+        if r.status_code != 200:
+            # In resume mode the server may answer 206 (partial content) or
+            # 416 (range not satisfiable, i.e. already complete). Both are fine.
+            if resume and r.status_code == 206:
+                pass
+            elif resume and r.status_code == 416:
+                logging.info('%s already downloaded', filename)
+                r.close()
+                return True
+            elif r.status_code in self.RETRY_STATUSES:
+                r.close()
+                raise requests.exceptions.HTTPError(
+                    'HTTP %s' % r.status_code, response=r
+                )
+            else:
+                if r.reason:
+                    reason = '%s %s' % (r.reason, r.status_code)
+                else:
+                    reason = 'HTTP Error %s' % r.status_code
+                logging.warning('Probably the file is missing from the repository: %s', url)
+                r.close()
+                raise requests.exceptions.HTTPError(reason, response=r)
+
+        if resume and r.status_code == 200:
+            # Server ignored our Range header; start the file again instead of
+            # appending to a partial body and corrupting it.
+            logging.debug('Server ignored Range for %s; restarting file', url)
+            filesize = 0
+            resume = False
+
+        content_length = r.headers.get('content-length')
+        chunk_sz = 1048576
+        progress = DownloadProgress(content_length)
+        progress.start()
+        started_at = time.time()
+        base_offset = filesize if (resume and filesize) else 0
+        expected_total = (int(content_length) + base_offset) if content_length else 0
+        written = 0
+        f = open(filename, 'ab') if resume else open(filename, 'wb')
+        try:
+            while True:
+                raise_if_cancelled()
+                wait_if_paused()
+                data = r.raw.read(chunk_sz, decode_content=True)
+                if not data:
+                    progress.stop()
+                    break
+                progress.report(r.raw.tell())
+                _publish_progress(
+                    filename, url,
+                    base_offset + written + len(data),
+                    expected_total,
+                    started_at,
+                )
+                f.write(data)
+                written += len(data)
+                _throttle(len(data))
+        finally:
+            f.close()
+            r.close()
+            PROGRESS['active'] = False
+
+        # A truncated body must not look like success: retry it.
+        if expected_total and base_offset + written < expected_total:
+            raise requests.exceptions.ChunkedEncodingError(
+                'incomplete download (%d of %d bytes)'
+                % (base_offset + written, expected_total)
+            )
+
+        PROGRESS['percent'] = 100 if expected_total else PROGRESS['percent']
+        clear_download_failure(filename)
+        return True
 
 
 def get_downloader(session, class_name, args):

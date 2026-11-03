@@ -27,7 +27,11 @@ from define import OPENCOURSE_ONDEMAND_SPECIALIZATIONS_V1
 from downloaders import (
     DownloadCancelled,
     current_progress,
+    set_speed_limit,
+    failed_files,
+    reset_file_status,
     reset_progress,
+    retrying_files,
     set_download_control_events,
 )
 from localdb import SimpleDB
@@ -65,6 +69,9 @@ LOG_RETENTION = 20000
 # Upper bound for concurrent file downloads. Each job opens its own connection,
 # so this is a politeness limit towards Coursera as much as a sanity check.
 MAX_PARALLEL_JOBS = 8
+
+# Upper bound for the bandwidth cap (KB/s). 0 means unlimited.
+MAX_SPEED_LIMIT_KB = 1024 * 100
 
 _LEVEL_PATTERNS = (
     ("ERROR", ("ERROR:", "Traceback (most recent call last)", "CRITICAL:")),
@@ -157,6 +164,8 @@ class DownloadJob:
                 "can_retry": self.last_payload is not None,
                 "last_was_resume": self.last_resume,
                 "progress": current_progress(),
+                "failed_files": failed_files(),
+                "retrying_files": retrying_files(),
             }
 
     def remember_request(self, payload, resume):
@@ -257,6 +266,7 @@ class DownloadJob:
         root_logger.addHandler(handler)
         set_download_control_events(self.cancel_event, self.pause_event)
         reset_progress()
+        reset_file_status()
         try:
             self.add_log("Resume started." if "--resume" in command else "Download started.")
             main_f(command)
@@ -1506,6 +1516,20 @@ def build_download_command(payload, resume=False, item=None):
     except OSError as exc:
         raise ValueError(f"Could not create the project folder: {exc}") from exc
 
+    # Bandwidth cap in KB/s; 0 means unlimited.
+    raw_limit = payload.get("speed_limit", 0)
+    if raw_limit in (None, ""):
+        raw_limit = 0
+    try:
+        speed_limit_kb = int(raw_limit)
+    except (TypeError, ValueError):
+        raise ValueError("Choose a valid download speed limit.")
+    if speed_limit_kb < 0 or speed_limit_kb > MAX_SPEED_LIMIT_KB:
+        raise ValueError(
+            "Download speed must be between 0 (unlimited) and %d KB/s." % MAX_SPEED_LIMIT_KB
+        )
+    set_speed_limit(speed_limit_kb * 1024)
+
     language_code = general.LANG_NAME_TO_CODE_MAPPING[language_name]
     class_names = [class_name]
     expand_in_downloader = False
@@ -2609,6 +2633,9 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/retry":
                 self.retry_download()
                 return
+            if parsed.path == "/api/retry-failed":
+                self.retry_failed_files()
+                return
             if parsed.path == "/api/download-state":
                 self.download_state(payload)
                 return
@@ -2674,6 +2701,28 @@ class WebHandler(BaseHTTPRequestHandler):
         save_config(config)
         JOB.start(command)
         self.send_json({"ok": True, "status": JOB.snapshot(), "retry_resume": resume})
+
+    def retry_failed_files(self):
+        """Re-attempt the files that exhausted their retries.
+
+        The workflow marks in-progress files with a `.partial` file and only
+        re-downloads those on --resume, so this retries exactly the failed set
+        instead of re-scanning the whole course.
+        """
+        pending = failed_files()
+        if not pending:
+            self.send_json({"ok": False, "reason": "There are no failed files to retry."})
+            return
+        payload, _ = JOB.retry_request()
+        item = payload.get("item", {})
+        command, config = build_download_command(payload, resume=True, item=item)
+        save_config(config)
+        JOB.start(command)
+        self.send_json({
+            "ok": True,
+            "count": len(pending),
+            "status": JOB.snapshot(),
+        })
 
     def download_state(self, payload):
         self.send_json(get_download_state(payload))

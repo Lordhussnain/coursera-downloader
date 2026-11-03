@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261103-features">
+    <link rel="stylesheet" href="/styles.css?v=20261103-retry">
     <script>
       // Applied before the body renders so a dark-theme user never sees a
       // white flash while the stylesheet loads.
@@ -84,6 +84,20 @@
                 </div>
 
                 <div class="field">
+                  <label for="speed_limit">Speed limit</label>
+                  <select id="speed_limit" name="speed_limit">
+                    <option value="0" selected>Unlimited</option>
+                    <option value="256">256 KB/s</option>
+                    <option value="512">512 KB/s</option>
+                    <option value="1024">1 MB/s</option>
+                    <option value="2048">2 MB/s</option>
+                    <option value="5120">5 MB/s</option>
+                    <option value="10240">10 MB/s</option>
+                  </select>
+                  <p class="field-hint">Caps total download bandwidth across all files. Useful on shared or metered connections.</p>
+                </div>
+
+                <div class="field">
                   <label for="subtitle_language">Subtitle language</label>
                   <select id="subtitle_language" name="subtitle_language"></select>
                 </div>
@@ -139,6 +153,18 @@
             <span id="jobProgressFile" class="job-progress-file"></span>
             <span id="jobProgressStats" class="job-progress-stats"></span>
           </div>
+          <p class="job-progress-retry" id="jobRetryNote" hidden></p>
+        </section>
+
+        <section class="failed-files" id="failedFiles" hidden>
+          <div class="failed-files-head">
+            <strong id="failedFilesTitle">Failed files</strong>
+            <div class="failed-files-actions">
+              <button type="button" class="secondary small" id="retryFailedBtn">Retry failed</button>
+              <button type="button" class="secondary small" id="dismissFailedBtn" title="Hide this list (files stay failed on disk)">Dismiss</button>
+            </div>
+          </div>
+          <ul class="failed-files-list" id="failedFilesList"></ul>
         </section>
       </section>
 
@@ -154,6 +180,10 @@
             <div class="tree-toolbar">
               <button type="button" class="secondary small" id="expandTreeBtn">Expand all</button>
               <button type="button" class="secondary small" id="collapseTreeBtn">Collapse all</button>
+              <button type="button" class="secondary small" id="openCourseBtn" hidden
+                      title="Open this course folder in the file manager">Open folder</button>
+              <button type="button" class="secondary small" id="retryCourseBtn" hidden
+                      title="Re-run this course; only missing or failed files download">Retry missing</button>
               <button type="button" class="secondary small danger" id="deleteCourseBtn" hidden
                       title="Delete this course folder from disk">Delete course</button>
             </div>
@@ -184,6 +214,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261103-features"></script>
+    <script src="/app.js?v=20261103-retry"></script>
   </body>
 </html>

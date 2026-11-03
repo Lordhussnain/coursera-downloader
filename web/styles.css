@@ -1387,3 +1387,66 @@ button.bad {
     border-top: 1px solid var(--line);
   }
 }
+
+/* ---------- Retry note and failed files ---------- */
+.job-progress-retry {
+  margin: 8px 0 0;
+  font-size: 0.8rem;
+  color: var(--warn-text);
+}
+
+.failed-files {
+  margin-top: 12px;
+  border: 1px solid var(--error-border);
+  border-radius: 8px;
+  background: var(--error-bg);
+  padding: 10px 12px;
+}
+
+.failed-files-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--error-text);
+}
+
+.failed-files-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.failed-files-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 190px;
+  overflow: auto;
+  display: grid;
+  gap: 4px;
+}
+
+.failed-file {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.8rem;
+  border-top: 1px solid var(--error-border);
+  padding-top: 4px;
+}
+
+.failed-file-name {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
+  color: var(--text);
+}
+
+.failed-file-reason {
+  color: var(--error-text);
+  text-align: right;
+  flex-shrink: 0;
+}

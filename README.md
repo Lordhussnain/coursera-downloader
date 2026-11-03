@@ -117,6 +117,31 @@ The app never asks for your Coursera password. It reuses the `CAUTH` session coo
 
 A CAUTH cookie copied by hand keeps working from any browser, and it is stored locally in `data.bin` (git-ignored) so downloads keep working on the next start.
 
+### Retries and failed files
+
+Every file is retried on its own, so a dropped connection no longer aborts the
+whole course (that used to happen: one network error killed every remaining
+file).
+
+- **4 attempts per file** with exponential backoff and jitter, so retries do not
+  stampede the server.
+- **Resumes, not restarts**: a retry continues from the bytes already on disk.
+- **Timeouts** (15s connect, 60s read) so a stalled socket never hangs forever.
+- **Permanent errors fail fast**: a 404 is not retried four times.
+- **Truncated bodies are detected** and retried instead of being reported as
+  success.
+
+When a file does exhaust its retries, the web UI lists it under **Failed files**
+with the reason and a **Retry failed** button. The **Retry missing** button
+re-runs the course with `--resume`, which re-downloads only files still carrying
+a `.partial` marker.
+
+### Speed limit
+
+**Settings -> Speed limit** caps total bandwidth across all files (Unlimited by
+default). Useful on metered or shared connections; the cap is global, so 2 MB/s
+is 2 MB/s in total even with 4 files in flight.
+
 ### Diagnosing a login that is not detected
 
 If one profile works and another does not, run the diagnostic script in the same

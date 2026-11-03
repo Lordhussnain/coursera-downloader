@@ -17,6 +17,8 @@ const loginCheckBtn = document.querySelector("#loginCheckBtn");
 const settingsToggleBtn = document.querySelector("#settingsToggleBtn");
 const themeToggleBtn = document.querySelector("#themeToggleBtn");
 const deleteCourseBtn = document.querySelector("#deleteCourseBtn");
+const openCourseBtn = document.querySelector("#openCourseBtn");
+const retryCourseBtn = document.querySelector("#retryCourseBtn");
 const settingsPanel = document.querySelector("#settingsPanel");
 const expandTreeBtn = document.querySelector("#expandTreeBtn");
 const collapseTreeBtn = document.querySelector("#collapseTreeBtn");
@@ -42,6 +44,12 @@ const logLevelFilter = document.querySelector("#logLevelFilter");
 const logAutoScroll = document.querySelector("#logAutoScroll");
 const logCopyBtn = document.querySelector("#logCopyBtn");
 const logClearBtn = document.querySelector("#logClearBtn");
+const jobRetryNote = document.querySelector("#jobRetryNote");
+const failedFiles = document.querySelector("#failedFiles");
+const failedFilesList = document.querySelector("#failedFilesList");
+const failedFilesTitle = document.querySelector("#failedFilesTitle");
+const retryFailedBtn = document.querySelector("#retryFailedBtn");
+const dismissFailedBtn = document.querySelector("#dismissFailedBtn");
 
 let statusTimer = null;
 // Live log buffer. The server streams only entries newer than logCursor, so a
@@ -82,7 +90,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261103-features");
+console.info("Coursera Downloader UI loaded: 20261103-retry");
 
 // Restore log view preferences. Reading them here (not at first poll) means the
 // filter is already correct when the first lines arrive.
@@ -195,6 +203,28 @@ function restoreJobsPreference() {
   });
 })();
 
+const SPEED_STORAGE_KEY = "courseraDownloader.speedLimit";
+
+(function initSpeedPreference() {
+  const select = document.querySelector("#speed_limit");
+  if (!select) return;
+  try {
+    const saved = localStorage.getItem(SPEED_STORAGE_KEY);
+    if (saved && Array.from(select.options).some((o) => o.value === saved)) {
+      select.value = saved;
+    }
+  } catch {
+    /* ignore */
+  }
+  select.addEventListener("change", () => {
+    try {
+      localStorage.setItem(SPEED_STORAGE_KEY, select.value);
+    } catch {
+      /* ignore */
+    }
+  });
+})();
+
 function payloadFromForm() {
   const formData = new FormData(form);
   return {
@@ -203,6 +233,7 @@ function payloadFromForm() {
     video_resolution: formData.get("video_resolution"),
     subtitle_language: formData.get("subtitle_language"),
     jobs: Number(formData.get("jobs")) || 1,
+    speed_limit: Number(formData.get("speed_limit")) || 0,
   };
 }
 
@@ -665,6 +696,50 @@ function formatDuration(seconds) {
   return `${s}s`;
 }
 
+let failedFilesDismissed = false;
+
+function renderFailedFiles(status) {
+  if (!failedFiles) return;
+  const failed = Array.isArray(status.failed_files) ? status.failed_files : [];
+  const retrying = Array.isArray(status.retrying_files) ? status.retrying_files : [];
+
+  // A note while automatic retries are in progress, so a temporary failure
+  // does not look like a permanent one.
+  if (jobRetryNote) {
+    if (retrying.length && !failed.length) {
+      jobRetryNote.hidden = false;
+      jobRetryNote.textContent = `Retrying ${retrying.length} file${
+        retrying.length === 1 ? "" : "s"
+      } automatically…`;
+    } else {
+      jobRetryNote.hidden = true;
+    }
+  }
+
+  if (!failed.length || failedFilesDismissed) {
+    failedFiles.hidden = true;
+    return;
+  }
+
+  failedFiles.hidden = false;
+  if (failedFilesTitle) {
+    failedFilesTitle.textContent = `${failed.length} file${
+      failed.length === 1 ? "" : "s"
+    } failed`;
+  }
+  failedFilesList.innerHTML = failed
+    .map((item) => {
+      const attempts = item.attempts ? ` — ${item.attempts} attempts` : "";
+      return `<li class="failed-file">
+        <span class="failed-file-name" title="${escapeHtml(item.filename || "")}">${escapeHtml(
+          item.name || item.filename || "unknown"
+        )}</span>
+        <span class="failed-file-reason">${escapeHtml(item.reason || "unknown error")}${attempts}</span>
+      </li>`;
+    })
+    .join("");
+}
+
 function renderProgress(status) {
   if (!jobProgress) return;
   const progress = status.progress || {};
@@ -717,6 +792,31 @@ function renderProgress(status) {
   jobProgressStats.textContent = parts.join(" · ");
 }
 
+let notifiedJobEnd = false;
+
+function notifyJobFinished(status) {
+  // Browser notifications only fire while this tab is open, which is exactly
+  // when the user is likely waiting on a long course download.
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const state = status.status || "";
+  if (status.running || !(state === "completed" || state === "failed")) return;
+  if (notifiedJobEnd) return;
+  notifiedJobEnd = true;
+
+  const failed = Array.isArray(status.failed_files) ? status.failed_files.length : 0;
+  if (state === "completed") {
+    const body = failed
+      ? `Finished with ${failed} file${failed === 1 ? "" : "s"} that could not be downloaded.`
+      : "All files downloaded successfully.";
+    new Notification("Coursera download finished", { body, tag: "coursera-download" });
+  } else {
+    new Notification("Coursera download failed", {
+      body: status.error || "See the log for details.",
+      tag: "coursera-download",
+    });
+  }
+}
+
 function renderStatus(status) {
   currentStatus = status;
   const state = status.status || "idle";
@@ -738,7 +838,15 @@ function renderStatus(status) {
   }
 
   renderProgress(status);
+  renderFailedFiles(status);
   updateDeleteButton();
+
+  // Reset the latch as soon as a new job starts so each run notifies once.
+  if (status.running) {
+    notifiedJobEnd = false;
+  } else {
+    notifyJobFinished(status);
+  }
 
   renderLogStream();
   syncLogPaneVisibility();
@@ -1487,6 +1595,16 @@ async function refreshStatus() {
   }
 }
 
+function requestNotificationPermission() {
+  try {
+    if ("Notification" in window && Notification.permission === "default") {
+      void Notification.requestPermission();
+    }
+  } catch {
+    /* not supported in this browser */
+  }
+}
+
 async function startDownload(endpoint) {
   clearMessage();
   userChangedExpansion = false;
@@ -1499,6 +1617,7 @@ async function startDownload(endpoint) {
   rememberCourseInput();
   renderStatus(result.status);
   showMessage(`${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`, true);
+  requestNotificationPermission();
   startStatusPolling();
   await updateDownloadState({ force: true });
 }
@@ -2024,14 +2143,32 @@ activityTree.addEventListener("click", (event) => {
 });
 
 function updateDeleteButton() {
-  if (!deleteCourseBtn) return;
   const hasCourse = Boolean(currentCourseFolder);
-  deleteCourseBtn.hidden = !hasCourse;
-  if (hasCourse) {
-    const running = Boolean(currentStatus && currentStatus.running);
-    deleteCourseBtn.title = running
-      ? "Stops the running download, then deletes this course folder"
-      : "Delete this course folder from disk";
+  const running = Boolean(currentStatus && currentStatus.running);
+  const failedCount = Array.isArray(currentStatus.failed_files)
+    ? currentStatus.failed_files.length
+    : 0;
+
+  if (deleteCourseBtn) {
+    deleteCourseBtn.hidden = !hasCourse;
+    if (hasCourse) {
+      deleteCourseBtn.title = running
+        ? "Stops the running download, then deletes this course folder"
+        : "Delete this course folder from disk";
+    }
+  }
+  if (openCourseBtn) {
+    // Opening the folder is useful even while downloading.
+    openCourseBtn.hidden = !hasCourse;
+  }
+  if (retryCourseBtn) {
+    const show = hasCourse && !running && (canResumeCurrentCourse || failedCount > 0);
+    retryCourseBtn.hidden = !show;
+    if (show) {
+      retryCourseBtn.title = failedCount
+        ? `Retry the ${failedCount} failed file${failedCount === 1 ? "" : "s"} plus anything missing`
+        : "Re-run this course; only missing or failed files download";
+    }
   }
 }
 
@@ -2104,6 +2241,66 @@ async function deleteCourse() {
   } finally {
     deleteCourseBtn.disabled = false;
   }
+}
+
+if (openCourseBtn) {
+  openCourseBtn.addEventListener("click", async () => {
+    if (!currentCourseFolder) return;
+    try {
+      await requestJson("/api/open-path", {
+        method: "POST",
+        body: JSON.stringify({ path: currentCourseFolder }),
+      });
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+}
+
+if (retryCourseBtn) {
+  retryCourseBtn.addEventListener("click", async () => {
+    retryCourseBtn.disabled = true;
+    try {
+      // --resume makes the workflow skip complete files and re-download only
+      // those with a .partial marker (i.e. the ones that failed).
+      await startDownload("/api/resume");
+    } catch (error) {
+      showMessage(error.message);
+    } finally {
+      retryCourseBtn.disabled = false;
+    }
+  });
+}
+
+if (retryFailedBtn) {
+  retryFailedBtn.addEventListener("click", async () => {
+    retryFailedBtn.disabled = true;
+    try {
+      const result = await requestJson("/api/retry-failed", {
+        method: "POST",
+        body: "{}",
+      });
+      if (!result.ok) {
+        showMessage(result.reason || "Nothing to retry.");
+        return;
+      }
+      failedFilesDismissed = false;
+      showMessage(`Retrying ${result.count} failed file${result.count === 1 ? "" : "s"}…`, true);
+      renderStatus(result.status);
+      startStatusPolling();
+    } catch (error) {
+      showMessage(error.message);
+    } finally {
+      retryFailedBtn.disabled = false;
+    }
+  });
+}
+
+if (dismissFailedBtn) {
+  dismissFailedBtn.addEventListener("click", () => {
+    failedFilesDismissed = true;
+    renderFailedFiles(currentStatus);
+  });
 }
 
 if (deleteCourseBtn) {
