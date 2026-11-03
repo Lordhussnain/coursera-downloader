@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261103-queue">
+    <link rel="stylesheet" href="/styles.css?v=20261103-back">
     <script>
       // Applied before the body renders so a dark-theme user never sees a
       // white flash while the stylesheet loads.
@@ -183,13 +183,15 @@
       <section class="activity">
         <button type="button" class="icon-button visually-hidden" id="refreshBtn" title="Refresh status">Refresh</button>
         <section id="recentCourses" class="recent-courses" hidden>
-          <h3>Recent courses</h3>
+          <h3 id="recentCoursesHeading" tabindex="-1">Recent courses</h3>
           <div id="recentCoursesGrid" class="recent-courses-grid"></div>
           <p id="recentCoursesEmpty" class="recent-courses-empty" hidden>No courses yet. Paste a Coursera URL above to begin.</p>
         </section>
         <div class="activity-body" id="activityBody" hidden>
           <div class="tree-panel">
             <div class="tree-toolbar">
+              <button type="button" class="secondary small back-button" id="backToCoursesBtn"
+                      title="Back to the recent courses list">← All courses</button>
               <button type="button" class="secondary small" id="expandTreeBtn">Expand all</button>
               <button type="button" class="secondary small" id="collapseTreeBtn">Collapse all</button>
               <button type="button" class="secondary small" id="openCourseBtn" hidden
@@ -226,6 +228,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261103-queue"></script>
+    <script src="/app.js?v=20261103-back"></script>
   </body>
 </html>

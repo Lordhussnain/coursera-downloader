@@ -798,8 +798,21 @@ button.bad {
 .tree-toolbar {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
   padding: 12px 18px 8px;
   border-bottom: 1px solid var(--line);
+}
+
+/* Sits first in the toolbar and stays visually distinct: it is navigation, not
+   a tool that acts on the course. */
+.back-button {
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.back-button[hidden] {
+  display: none !important;
 }
 
 .activity-tree {

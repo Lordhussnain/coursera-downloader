@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.8.1
+- **Back to the course list.** Opening a recent course showed its tree and log
+  with no way to return to the list and choose another one. A **← All courses**
+  button now sits at the left of the tree toolbar.
+- Going back also survives the background status poll, which previously
+  re-rendered the tree and yanked the list away as soon as the course folder
+  had any content.
+- `showRecentCoursesLanding()` no longer returns early when a course is loaded,
+  which was why the list could be hidden but never shown again.
+
 ## v3.8.0
 - **Course queue.** Pasting a second URL while a course downloads now adds it to
   the queue instead of failing. Queued courses start on their own, in order, as

@@ -139,6 +139,13 @@ Notes:
 3. Click **Login**, sign in to Coursera in the browser window that opens, then click **Login** again.
 4. Select and download courses.
 
+## Recent courses
+
+When the app opens it lists the courses you have pasted before. Click one to see
+its file tree and log. Press **← All courses** at the left of the toolbar to go
+back and pick a different course - the list stays available even while a
+download is running.
+
 ## Queueing several courses
 
 Paste a course URL and press **Download**. While that course is downloading the

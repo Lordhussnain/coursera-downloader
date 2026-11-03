@@ -30,6 +30,7 @@ const queueCurrent = document.querySelector("#queueCurrent");
 const clearQueueBtn = document.querySelector("#clearQueueBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
+const backToCoursesBtn = document.querySelector("#backToCoursesBtn");
 const authBrowserSelect = document.querySelector("#auth_browser");
 const authProfileSelect = document.querySelector("#auth_profile");
 const authRefreshBtn = document.querySelector("#authRefreshBtn");
@@ -95,7 +96,7 @@ const AUTH_HINT_MESSAGE =
 const AUTH_STORAGE_KEY = "courseraDownloader.authStatus";
 const SETTINGS_STORAGE_KEY = "courseraDownloader.settingsVisible.v3";
 const COURSE_INPUT_STORAGE_KEY = "courseraDownloader.lastCourseInput.v3";
-console.info("Coursera Downloader UI loaded: 20261103-queue");
+console.info("Coursera Downloader UI loaded: 20261103-back");
 
 // Restore log view preferences. Reading them here (not at first poll) means the
 // filter is already correct when the first lines arrive.
@@ -274,13 +275,17 @@ function clearCourseInput() {
   courseInput.focus();
 }
 
+// True while the recent-courses list is the visible screen. The status poll
+// renders the tree on every tick, which used to yank the landing away the
+// moment a course folder had any content. This flag lets an explicit Back
+// click win over that until the user picks a course again.
+let showingCourseLanding = false;
+
 function showRecentCoursesLanding() {
   if (!recentCoursesSection || !activityBody) return;
-  if (courseInput.value.trim() || downloadedActivityGroups.length) {
-    recentCoursesSection.hidden = true;
-    activityBody.hidden = false;
-    return;
-  }
+  // Always show the list when asked. This used to return early whenever a
+  // course was loaded or the input had text, so the Back button had nothing
+  // to show: the landing could be hidden but never brought back.
   const list = getCourseHistory();
   const empty = document.querySelector("#recentCoursesEmpty");
   recentCoursesGrid.innerHTML = list.map((url) => `
@@ -294,11 +299,33 @@ function showRecentCoursesLanding() {
   if (empty) empty.hidden = list.length > 0;
   recentCoursesSection.hidden = false;
   activityBody.hidden = true;
+  showingCourseLanding = true;
+  updateBackButton();
 }
 
-function hideRecentCoursesLanding() {
+function hideRecentCoursesLanding(options) {
+  // The background poll must not pull the user out of the list they just
+  // navigated back to; only an explicit action (picking a course, typing a
+  // URL, starting a download) should.
+  if (options && options.auto && showingCourseLanding) return;
+  showingCourseLanding = false;
   if (recentCoursesSection) recentCoursesSection.hidden = true;
   if (activityBody) activityBody.hidden = false;
+  updateBackButton();
+}
+
+// The Back button only makes sense when there is a list to go back to, so it is
+// hidden when the history is empty rather than offering a dead end.
+function updateBackButton() {
+  if (!backToCoursesBtn) return;
+  const hasHistory = getCourseHistory().length > 0;
+  const onLanding = recentCoursesSection ? !recentCoursesSection.hidden : false;
+  backToCoursesBtn.hidden = !hasHistory || onLanding;
+  backToCoursesBtn.textContent = "\u2190 All courses";
+  const viewing = courseInput && courseInput.value.trim() ? courseInput.value.trim() : "";
+  backToCoursesBtn.title = viewing
+    ? `Back to the recent courses list (currently viewing ${courseTitleFromUrl(viewing)})`
+    : "Back to the recent courses list";
 }
 
 function courseTitleFromUrl(url) {
@@ -1220,7 +1247,7 @@ function renderActivityGroups(groups, options = {}) {
     currentSidebarNodes = [];
     return;
   }
-  hideRecentCoursesLanding();
+  hideRecentCoursesLanding({ auto: true });
 
   currentTreeNodes = buildFolderTree(groups);
   currentSidebarNodes = currentTreeNodes.filter((node) => !isSessionNode(node));
@@ -1733,6 +1760,9 @@ async function startDownload(endpoint) {
   rememberCourseInput();
   renderStatus(result.status);
   showMessage(`${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`, true);
+  // An explicit download is a hard exit from the list view; the auto-guard the
+  // poll uses must not keep the user on it.
+  hideRecentCoursesLanding();
   requestNotificationPermission();
   startStatusPolling();
   await updateDownloadState({ force: true });
@@ -2012,7 +2042,9 @@ courseInput.addEventListener("input", () => {
   renderCourseHistory();
   if (courseInput.value.trim()) {
     hideRecentCoursesLanding();
-  } else if (!downloadedActivityGroups.length) {
+  } else if (!downloadedActivityGroups.length && !showingCourseLanding) {
+    // Only fall back to the list when there is no course being viewed; an empty
+    // input while browsing the list must not re-render it on every keystroke.
     showRecentCoursesLanding();
   }
 });
@@ -2024,6 +2056,27 @@ if (courseClearBtn) {
   });
 }
 
+function goBackToCourses() {
+  // Leaving the detail view drops the course selection so the landing list is
+  // the single source of truth again. The tree/log are rebuilt from the folder
+  // if the course is picked again, so nothing is lost by clearing them.
+  courseInput.value = "";
+  localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  hideCourseHistory();
+  downloadedActivityGroups = [];
+  lastSessionLogGroups = [];
+  currentTreeNodes = [];
+  currentSidebarNodes = [];
+  selectedTreeId = "";
+  canResumeCurrentCourse = false;
+  updateClearButtonVisibility();
+  if (recentCoursesSection) recentCoursesSection.hidden = true;
+  if (activityBody) activityBody.hidden = true;
+  showRecentCoursesLanding();
+  const heading = document.querySelector("#recentCoursesHeading");
+  if (heading) heading.focus();
+}
+
 function pickRecentCourse(url) {
   if (!url) return;
   courseInput.value = url;
@@ -2032,7 +2085,15 @@ function pickRecentCourse(url) {
   updateClearButtonVisibility();
   hideCourseHistory();
   hideRecentCoursesLanding();
+  updateBackButton();
   void updateDownloadState({ force: true, render: true });
+}
+
+if (backToCoursesBtn) {
+  backToCoursesBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    goBackToCourses();
+  });
 }
 
 document.addEventListener("click", (event) => {
