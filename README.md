@@ -154,6 +154,12 @@ button reads **Add to queue**: paste the next URL and press it again. Repeat for
 as many courses as you like - they download one after another, automatically,
 with no need to wait and no need to press anything between them.
 
+To queue a list at once, choose **Add multiple links**, paste one Coursera URL
+per line (or separate links with commas), then press **Add links**. The app
+checks the whole batch before adding it, accepts up to 50 links per batch, and
+starts the first course immediately when the queue is idle. The current
+settings and login are used for every link.
+
 - The **Queue** panel lists what is waiting, in order, and names the course
   downloading right now.
 - Each row has **↑**, **↓** and **×** to reorder or remove it.

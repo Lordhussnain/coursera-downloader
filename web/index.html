@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20261103-back">
+    <link rel="stylesheet" href="/styles.css?v=20261103-bulk-queue">
     <script>
       // Applied before the body renders so a dark-theme user never sees a
       // white flash while the stylesheet loads.
@@ -49,6 +49,26 @@
               <button type="button" class="secondary danger" id="cancelBtn" hidden>Cancel</button>
             </div>
           </div>
+
+          <div class="bulk-links-toggle-row">
+            <button type="button" class="secondary small" id="bulkLinksToggleBtn"
+                    aria-expanded="false" aria-controls="bulkLinksPanel">Add multiple links</button>
+            <span class="bulk-links-short-hint">Paste a list and queue them together.</span>
+          </div>
+
+          <section class="bulk-links-panel" id="bulkLinksPanel" hidden>
+            <div class="bulk-links-copy">
+              <label for="bulkLinksInput">Course links</label>
+              <p id="bulkLinksHelp">Paste one Coursera course, specialization, or certificate URL per line. Current settings and login will be used for every link.</p>
+            </div>
+            <textarea id="bulkLinksInput" rows="4" maxlength="50000"
+                      aria-describedby="bulkLinksHelp bulkLinksCount"
+                      placeholder="https://www.coursera.org/learn/course-one&#10;https://www.coursera.org/learn/course-two"></textarea>
+            <div class="bulk-links-footer">
+              <span id="bulkLinksCount" class="bulk-links-count" aria-live="polite">0 links</span>
+              <button type="button" class="queue-start" id="bulkQueueBtn" disabled>Add links</button>
+            </div>
+          </section>
 
           <section id="settingsPanel" class="settings-panel" hidden>
             <div class="settings-content">
@@ -142,14 +162,19 @@
 
         <section class="download-queue" id="downloadQueue" hidden>
           <div class="queue-head">
-            <strong id="queueTitle">Queue</strong>
+            <div class="queue-heading">
+              <strong id="queueTitle">Queue</strong>
+              <span id="queueSummary" class="queue-summary" aria-live="polite">Courses run in the order shown.</span>
+            </div>
             <div class="queue-actions">
+              <button type="button" class="queue-start" id="startQueueBtn" hidden
+                      title="Start the next waiting course and continue through the queue">Start queue</button>
               <button type="button" class="secondary small" id="clearQueueBtn"
                       title="Remove every course from the queue">Clear queue</button>
             </div>
           </div>
           <p class="queue-current" id="queueCurrent" hidden></p>
-          <ul class="queue-list" id="queueList"></ul>
+          <ul class="queue-list" id="queueList" aria-labelledby="queueTitle"></ul>
         </section>
 
         <section class="job-progress" id="jobProgress" hidden>
@@ -228,6 +253,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20261103-back"></script>
+    <script src="/app.js?v=20261103-bulk-queue"></script>
   </body>
 </html>

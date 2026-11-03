@@ -26,8 +26,16 @@ const courseClearBtn = document.querySelector("#courseClearBtn");
 const downloadQueue = document.querySelector("#downloadQueue");
 const queueList = document.querySelector("#queueList");
 const queueTitle = document.querySelector("#queueTitle");
+const queueSummary = document.querySelector("#queueSummary");
 const queueCurrent = document.querySelector("#queueCurrent");
+const startQueueBtn = document.querySelector("#startQueueBtn");
 const clearQueueBtn = document.querySelector("#clearQueueBtn");
+let renderedQueueMarkup = null;
+const bulkLinksToggleBtn = document.querySelector("#bulkLinksToggleBtn");
+const bulkLinksPanel = document.querySelector("#bulkLinksPanel");
+const bulkLinksInput = document.querySelector("#bulkLinksInput");
+const bulkLinksCount = document.querySelector("#bulkLinksCount");
+const bulkQueueBtn = document.querySelector("#bulkQueueBtn");
 const recentCoursesSection = document.querySelector("#recentCourses");
 const recentCoursesGrid = document.querySelector("#recentCoursesGrid");
 const backToCoursesBtn = document.querySelector("#backToCoursesBtn");
@@ -258,8 +266,12 @@ function updateClearButtonVisibility() {
 }
 
 function clearCourseInput() {
-  courseInput.value = "";
-  localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  if (result.queued) {
+    courseInput.value = "";
+    localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
+  } else {
+    rememberCourseInput();
+  }
   hideCourseHistory();
   downloadedActivityGroups = [];
   lastSessionLogGroups = [];
@@ -861,42 +873,61 @@ function renderQueue(status) {
   if (!downloadQueue) return;
   const queue = Array.isArray(status.queue) ? status.queue : [];
   const runningCourse = status.current_course || "";
+  const running = Boolean(status.running);
   const show = queue.length > 0 || Boolean(runningCourse);
   downloadQueue.hidden = !show;
   if (!show) {
     queueList.innerHTML = "";
+    renderedQueueMarkup = null;
+    if (startQueueBtn) startQueueBtn.hidden = true;
     return;
   }
   if (queueTitle) {
     queueTitle.textContent = queue.length
-      ? `Queue (${queue.length} waiting)`
+      ? `${queue.length} course${queue.length === 1 ? "" : "s"} waiting`
       : "Queue";
   }
+  if (queueSummary) {
+    queueSummary.textContent = running
+      ? "The next course starts automatically when this download finishes."
+      : "Start the queue to continue in the order shown.";
+  }
+  if (startQueueBtn) startQueueBtn.hidden = running || queue.length === 0;
   if (queueCurrent) {
     queueCurrent.hidden = !runningCourse;
-    queueCurrent.textContent = runningCourse ? `Downloading now: ${runningCourse}` : "";
+    queueCurrent.textContent = runningCourse
+      ? `Downloading now: ${queueCourseLabel({ course: runningCourse })}`
+      : "";
   }
-  queueList.innerHTML = queue
+  const queueMarkup = queue
     .map((entry, index) => {
       const label = escapeHtml(queueCourseLabel(entry));
       const sub = escapeHtml(entry.path || "");
+      const mode = entry.resume ? "Resume" : "Download";
       const upDisabled = index === 0 ? " disabled" : "";
       const downDisabled = index === queue.length - 1 ? " disabled" : "";
       return `
-        <li class="queue-item" data-entry-id="${entry.id}">
-          <span class="queue-index">${index + 1}</span>
+        <li class="queue-item" data-entry-id="${entry.id}" aria-label="Position ${index + 1}: ${label}">
+          <span class="queue-index" aria-hidden="true">${index + 1}</span>
           <span class="queue-text">
-            <span class="queue-name">${label}</span>
-            <span class="queue-path" title="${sub}">${sub}</span>
+            <span class="queue-name-row">
+              <span class="queue-name">${label}</span>
+              <span class="queue-mode-tag">${mode}</span>
+            </span>
+            <span class="queue-path" title="${sub}">${sub || "Default download folder"}</span>
           </span>
           <span class="queue-item-actions">
-            <button type="button" class="secondary small queue-up" title="Move up"${upDisabled}>↑</button>
-            <button type="button" class="secondary small queue-down" title="Move down"${downDisabled}>↓</button>
-            <button type="button" class="secondary small queue-remove" title="Remove from queue">×</button>
+            <button type="button" class="secondary small queue-up" aria-label="Move ${label} up" title="Move up"${upDisabled}>↑</button>
+            <button type="button" class="secondary small queue-down" aria-label="Move ${label} down" title="Move down"${downDisabled}>↓</button>
+            <button type="button" class="secondary small queue-remove" aria-label="Remove ${label} from queue" title="Remove from queue">×</button>
           </span>
         </li>`;
     })
     .join("");
+  if (queueMarkup !== renderedQueueMarkup) {
+    queueList.innerHTML = queueMarkup;
+    renderedQueueMarkup = queueMarkup;
+  }
   if (clearQueueBtn) clearQueueBtn.hidden = queue.length === 0;
 }
 
@@ -1536,7 +1567,13 @@ function detailSummary(node) {
   const files = nodeFileCount(node);
   const folders = node.children.length;
   const status = node.status ? statusText(node.status, node.fileCount) : "";
-  const source = node.treeSource === "site" ? "Site tree" : node.treeSource === "missing" ? "Manifest missing" : "";
+  const source = node.treeSource === "site"
+    ? "Site tree"
+    : node.treeSource === "folder"
+      ? "Folder scan"
+      : node.treeSource === "missing"
+        ? "Manifest missing"
+        : "";
   const unit = node.treeSource === "site" ? "item" : "file";
   return [source, status, folders ? `${folders} folder${folders === 1 ? "" : "s"}` : "", nodeProgressText(node), `${files} ${unit}${files === 1 ? "" : "s"}`]
     .filter(Boolean)
@@ -1703,7 +1740,68 @@ function requestNotificationPermission() {
 }
 
 function queueCourseLabel(entry) {
-  return entry.class_name || entry.course || "Course";
+  if (entry.class_name) return entry.class_name;
+  const course = String(entry.course || "");
+  return courseTitleFromUrl(course) || course || "Course";
+}
+
+function parseBulkCourseLinks() {
+  if (!bulkLinksInput) return [];
+  return bulkLinksInput.value
+    .split(/[\r\n,]+/)
+    .map((line) => line.trim().replace(/^(?:[-*•]\s+|\d+[.)]\s+)/, ""))
+    .map((line) => line.replace(/^<(.+)>$/, "$1").replace(/^(["'])(.*)\1$/, "$2").trim())
+    .filter(Boolean);
+}
+
+function updateBulkLinkCount() {
+  if (!bulkLinksInput || !bulkLinksCount || !bulkQueueBtn) return;
+  const count = parseBulkCourseLinks().length;
+  const tooMany = count > 50;
+  bulkLinksCount.textContent = tooMany
+    ? `${count} links — maximum 50 per batch`
+    : `${count} link${count === 1 ? "" : "s"} detected · maximum 50`;
+  bulkQueueBtn.disabled = count === 0 || tooMany;
+  bulkQueueBtn.textContent = count
+    ? `${currentStatus?.running ? "Queue" : "Add"} ${count} link${count === 1 ? "" : "s"}`
+    : "Add links";
+}
+
+async function queueBulkLinks() {
+  const courses = parseBulkCourseLinks();
+  if (!courses.length || courses.length > 50 || !bulkQueueBtn) return;
+  bulkQueueBtn.disabled = true;
+  bulkQueueBtn.textContent = "Adding…";
+  try {
+    const result = await requestJson("/api/queue-batch", {
+      method: "POST",
+      body: JSON.stringify({ ...authPayload(payloadFromForm()), courses }),
+    });
+    renderStatus(result.status);
+    bulkLinksInput.value = "";
+    updateBulkLinkCount();
+    if (result.started) {
+      courseInput.value = result.started.course || "";
+      if (result.started.path) pathInput.value = result.started.path;
+      rememberCourseInput();
+    }
+    hideRecentCoursesLanding();
+    requestNotificationPermission();
+    startStatusPolling();
+    if (result.started) await updateDownloadState({ force: true });
+    const waiting = Number(result.queued) || 0;
+    showMessage(
+      `${result.added} link${result.added === 1 ? "" : "s"} added. ` +
+        (result.started
+          ? `${queueCourseLabel(result.started)} started${waiting ? `; ${waiting} more queued` : ""}.`
+          : `${waiting} course${waiting === 1 ? "" : "s"} queued behind the current download.`),
+      true
+    );
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    updateBulkLinkCount();
+  }
 }
 
 async function enqueueCurrentCourse() {
@@ -1718,7 +1816,12 @@ async function enqueueCurrentCourse() {
     body: JSON.stringify(payload),
   });
   renderStatus(result.status);
-  showMessage("Added to the queue. It starts automatically when the current download finishes.", true);
+  showMessage(
+    result.queued
+      ? "Added to the queue. It starts automatically when the current download finishes."
+      : "The queue was idle, so the download started now.",
+    true
+  );
   hideRecentCoursesLanding();
   // Only the input is cleared. The tree and log still belong to the course that
   // is downloading right now, so they must not be reset here.
@@ -1726,6 +1829,11 @@ async function enqueueCurrentCourse() {
   localStorage.removeItem(COURSE_INPUT_STORAGE_KEY);
   updateClearButtonVisibility();
   hideCourseHistory();
+  if (!result.queued) {
+    requestNotificationPermission();
+    startStatusPolling();
+    await updateDownloadState({ force: true });
+  }
 }
 
 async function removeQueueEntry(entryId) {
@@ -1746,9 +1854,30 @@ async function moveQueueEntry(entryId, offset) {
 }
 
 async function clearQueue() {
+  const count = Array.isArray(currentStatus?.queue) ? currentStatus.queue.length : 0;
+  if (count && !window.confirm(`Remove all ${count} waiting course${count === 1 ? "" : "s"}?`)) return;
   const result = await requestJson("/api/queue-clear", { method: "POST", body: "{}" });
   renderStatus(result.status);
-  showMessage("Queue cleared.", true);
+  showMessage(`Removed ${result.removed || 0} course${result.removed === 1 ? "" : "s"} from the queue.`, true);
+}
+
+async function startQueuedCourses() {
+  if (!startQueueBtn) return;
+  startQueueBtn.disabled = true;
+  try {
+    const result = await requestJson("/api/queue-start", {
+      method: "POST",
+      body: "{}",
+    });
+    renderStatus(result.status);
+    showMessage("Queue resumed. The remaining courses will run in order.", true);
+    requestNotificationPermission();
+    startStatusPolling();
+  } catch (error) {
+    showMessage(error.message);
+  } finally {
+    startQueueBtn.disabled = false;
+  }
 }
 
 async function startDownload(endpoint) {
@@ -1762,13 +1891,18 @@ async function startDownload(endpoint) {
   });
   rememberCourseInput();
   renderStatus(result.status);
-  showMessage(`${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`, true);
+  showMessage(
+    result.queued
+      ? "Added to the queue. It will run in order after the current course."
+      : `${endpoint === "/api/resume" ? "Resume" : "Download"} started. Keep this server window open until it finishes.`,
+    true
+  );
   // An explicit download is a hard exit from the list view; the auto-guard the
   // poll uses must not keep the user on it.
   hideRecentCoursesLanding();
   requestNotificationPermission();
   startStatusPolling();
-  await updateDownloadState({ force: true });
+  if (!result.queued) await updateDownloadState({ force: true });
 }
 
 async function updateDownloadState(options = {}) {
@@ -2191,6 +2325,35 @@ if (clearQueueBtn) {
     } catch (error) {
       showMessage(error.message);
     }
+  });
+}
+
+if (startQueueBtn) {
+  startQueueBtn.addEventListener("click", () => {
+    void startQueuedCourses();
+  });
+}
+
+if (bulkLinksToggleBtn && bulkLinksPanel && bulkLinksInput) {
+  bulkLinksToggleBtn.addEventListener("click", () => {
+    const show = bulkLinksPanel.hidden;
+    bulkLinksPanel.hidden = !show;
+    bulkLinksToggleBtn.setAttribute("aria-expanded", String(show));
+    bulkLinksToggleBtn.textContent = show ? "Hide multiple links" : "Add multiple links";
+    if (show) bulkLinksInput.focus();
+  });
+  bulkLinksInput.addEventListener("input", updateBulkLinkCount);
+  bulkLinksInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      void queueBulkLinks();
+    }
+  });
+}
+
+if (bulkQueueBtn) {
+  bulkQueueBtn.addEventListener("click", () => {
+    void queueBulkLinks();
   });
 }
 
@@ -2646,4 +2809,5 @@ loginCheckBtn.addEventListener("click", async () => {
   }
 });
 
+updateBulkLinkCount();
 init().catch((error) => showMessage(error.message));

@@ -119,6 +119,7 @@ LOG_RETENTION = 20000
 # Upper bound for concurrent file downloads. Each job opens its own connection,
 # so this is a politeness limit towards Coursera as much as a sanity check.
 MAX_PARALLEL_JOBS = 8
+MAX_QUEUE_SIZE = 50
 
 # Upper bound for the bandwidth cap (KB/s). 0 means unlimited.
 MAX_SPEED_LIMIT_KB = 1024 * 100
@@ -179,6 +180,56 @@ class DownloadJob:
         # second course's log lines would be filtered out as "already seen".
         self.job_seq = 0
 
+    @staticmethod
+    def public_queue_entry(entry):
+        """Expose queue labels and controls without request credentials."""
+        return {
+            "id": entry.get("id"),
+            "course": entry.get("course", ""),
+            "class_name": entry.get("class_name", ""),
+            "path": entry.get("path", ""),
+            "resume": bool(entry.get("resume")),
+            "added_at": entry.get("added_at"),
+        }
+
+    @staticmethod
+    def queue_identity(payload):
+        course = str(payload.get("course", "")).strip()
+        class_name, is_multi_course = general.parse_course_input(course)
+        normalized_course = str(class_name or course).strip().rstrip("/").casefold()
+        raw_path = str(payload.get("path", "")).strip()
+        normalized_path = os.path.normcase(str(Path(raw_path).expanduser().resolve())) if raw_path else ""
+        return normalized_course, bool(is_multi_course), normalized_path
+
+    def _enqueue_locked(self, payload, command, resume):
+        course = str(payload.get("course", "")).strip()
+        if not course:
+            raise ValueError("Choose a course before adding it to the queue.")
+        identity = self.queue_identity(payload)
+        if any(self.queue_identity(entry.get("payload") or {}) == identity for entry in self.queue):
+            raise ValueError("That course is already in the queue for this folder.")
+        if self.running and self.last_payload and self.queue_identity(self.last_payload) == identity:
+            raise ValueError("That course is already downloading to this folder.")
+        if len(self.queue) >= MAX_QUEUE_SIZE:
+            raise ValueError("The queue is full. Remove a course before adding another.")
+
+        self.queue_seq += 1
+        class_name = str(payload.get("_class_name", "")).strip()
+        if not class_name:
+            class_name, _ = general.parse_course_input(course)
+        entry = {
+            "id": self.queue_seq,
+            "course": course,
+            "class_name": display_slug(class_name) if class_name else course,
+            "path": str(payload.get("path", "")).strip(),
+            "resume": bool(resume),
+            "added_at": time.time(),
+            "payload": dict(payload),
+            "command": list(command),
+        }
+        self.queue.append(entry)
+        return entry
+
     def add_log(self, message):
         with self.lock:
             timestamp = time.strftime("%H:%M:%S")
@@ -228,7 +279,7 @@ class DownloadJob:
                 "failed_files": failed_files(),
                 "retrying_files": retrying_files(),
                 "job_seq": self.job_seq,
-                "queue": [dict(entry) for entry in self.queue],
+                "queue": [self.public_queue_entry(entry) for entry in self.queue],
                 "current_course": self._current_course_locked(),
             }
 
@@ -240,7 +291,7 @@ class DownloadJob:
 
     def queue_snapshot(self):
         with self.lock:
-            return [dict(entry) for entry in self.queue]
+            return [self.public_queue_entry(entry) for entry in self.queue]
 
     def enqueue(self, payload, command, resume):
         """Prepare a job to run after the current one.
@@ -250,26 +301,66 @@ class DownloadJob:
         queue reaches it. Everything needed to start it is stored here, so a
         queued course does not depend on the form still saying what it said.
         """
-        course = str(payload.get("course", "")).strip()
         with self.lock:
-            if any(entry.get("payload", {}).get("course", "").strip() == course for entry in self.queue):
-                raise ValueError("That course is already in the queue.")
-            if self.running and self._current_course_locked() == course:
-                raise ValueError("That course is already downloading.")
-            self.queue_seq += 1
-            entry = {
-                "id": self.queue_seq,
-                "course": course,
-                "class_name": str(payload.get("_class_name", "")),
-                "path": str(payload.get("path", "")).strip(),
-                "resume": bool(resume),
-                "added_at": time.time(),
-                "payload": dict(payload),
-                "command": list(command),
+            entry = self._enqueue_locked(payload, command, resume)
+        self.add_log("Queued: %s" % (entry["class_name"] or entry["course"]))
+        return self.public_queue_entry(entry)
+
+    def enqueue_batch(self, prepared):
+        """Add a validated batch atomically, starting the oldest item if idle."""
+        if not prepared:
+            raise ValueError("Paste at least one course link.")
+        if len(prepared) > MAX_QUEUE_SIZE:
+            raise ValueError("Add no more than %d course links at a time." % MAX_QUEUE_SIZE)
+
+        with self.lock:
+            if len(self.queue) + len(prepared) > MAX_QUEUE_SIZE:
+                raise ValueError(
+                    "The queue can hold up to %d waiting courses. Remove some before adding this batch."
+                    % MAX_QUEUE_SIZE
+                )
+
+            identities = {
+                self.queue_identity(entry.get("payload") or {})
+                for entry in self.queue
             }
-            self.queue.append(entry)
-        self.add_log("Queued: %s" % (entry["class_name"] or course))
-        return dict(entry)
+            if self.running and self.last_payload:
+                identities.add(self.queue_identity(self.last_payload))
+            for index, (payload, _command, _resume) in enumerate(prepared, start=1):
+                identity = self.queue_identity(payload)
+                if identity in identities:
+                    raise ValueError("Link %d is already in the queue or downloading." % index)
+                identities.add(identity)
+
+            added = [self._enqueue_locked(payload, command, resume) for payload, command, resume in prepared]
+            start_entry = None
+            if not self.running:
+                start_entry = self._pop_next_queued_locked()
+                if start_entry is not None:
+                    command = list(start_entry.get("command") or [])
+                    self._prepare_start_locked(
+                        command,
+                        start_entry.get("payload"),
+                        start_entry.get("resume", False),
+                    )
+                else:
+                    command = None
+            else:
+                command = None
+
+        started_id = start_entry.get("id") if start_entry else None
+        for entry in added:
+            if entry["id"] != started_id:
+                self.add_log("Queued: %s" % (entry["class_name"] or entry["course"]))
+        if start_entry is not None:
+            self.add_log("Queue: starting %s" % (start_entry.get("class_name") or start_entry.get("course", "")))
+            thread = threading.Thread(target=self._run, args=(command,), daemon=True)
+            thread.start()
+
+        return {
+            "added": [self.public_queue_entry(entry) for entry in added],
+            "started": self.public_queue_entry(start_entry) if start_entry else None,
+        }
 
     def dequeue(self, entry_id):
         with self.lock:
@@ -356,31 +447,79 @@ class DownloadJob:
         Returns ("started", None) or ("queued", entry). This is the behaviour a
         user expects when pasting a second link while a course downloads.
         """
+        queued_entry = None
+        thread_command = None
+        start_label = ""
         with self.lock:
-            busy = self.running
-        if busy:
-            return "queued", self.enqueue(payload, command, resume)
-        self.start(command, payload=payload, resume=resume)
+            if self.running:
+                queued_entry = self._enqueue_locked(payload, command, resume)
+            elif self.queue:
+                # Preserve FIFO if a previous failure left courses waiting.
+                queued_entry = self._enqueue_locked(payload, command, resume)
+                next_entry = self._pop_next_queued_locked()
+                thread_command = list(next_entry.get("command") or [])
+                self._prepare_start_locked(
+                    thread_command,
+                    next_entry.get("payload"),
+                    next_entry.get("resume", False),
+                )
+                start_label = next_entry.get("class_name") or next_entry.get("course", "")
+            else:
+                thread_command = list(command)
+                self._prepare_start_locked(thread_command, payload, resume)
+
+        if queued_entry is not None:
+            self.add_log("Queued: %s" % (queued_entry["class_name"] or queued_entry["course"]))
+        if thread_command is not None:
+            if start_label:
+                self.add_log("Queue resumed: starting %s" % start_label)
+            thread = threading.Thread(target=self._run, args=(thread_command,), daemon=True)
+            thread.start()
+        if queued_entry is not None:
+            return "queued", self.public_queue_entry(queued_entry)
         return "started", None
 
-    def start(self, command, payload=None, resume=False):
+    def start_next_queued(self):
+        """Start the oldest waiting course after an earlier job was stopped."""
         with self.lock:
             if self.running:
                 raise RuntimeError("A download is already running.")
-            if payload is not None:
-                self.last_payload = dict(payload)
-                self.last_resume = bool(resume)
-            self.running = True
-            self.status = "running"
-            self.error = ""
-            self.command = list(command)
-            self.logs = []
-            self.log_seq = 0
-            self.job_seq += 1
-            self.started_at = time.time()
-            self.finished_at = None
-            self.cancel_event.clear()
-            self.pause_event.clear()
+            entry = self._pop_next_queued_locked()
+            if entry is None:
+                return None
+            command = list(entry.get("command") or [])
+            self._prepare_start_locked(
+                command,
+                entry.get("payload"),
+                entry.get("resume", False),
+            )
+
+        self.add_log("Queue resumed: starting %s" % (entry.get("class_name") or entry.get("course", "")))
+        thread = threading.Thread(target=self._run, args=(command,), daemon=True)
+        thread.start()
+        return self.public_queue_entry(entry)
+
+    def _prepare_start_locked(self, command, payload=None, resume=False):
+        if self.running:
+            raise RuntimeError("A download is already running.")
+        if payload is not None:
+            self.last_payload = dict(payload)
+            self.last_resume = bool(resume)
+        self.running = True
+        self.status = "running"
+        self.error = ""
+        self.command = list(command)
+        self.logs = []
+        self.log_seq = 0
+        self.job_seq += 1
+        self.started_at = time.time()
+        self.finished_at = None
+        self.cancel_event.clear()
+        self.pause_event.clear()
+
+    def start(self, command, payload=None, resume=False):
+        with self.lock:
+            self._prepare_start_locked(command, payload, resume)
 
         thread = threading.Thread(target=self._run, args=(list(command),), daemon=True)
         thread.start()
@@ -417,14 +556,26 @@ class DownloadJob:
         pending = list(command)
         while True:
             outcome = self._run_one(pending)
+            canceled_at_boundary = False
             with self.lock:
-                entry = self._pop_next_queued_locked() if outcome == "ok" else None
+                # A cancel can arrive after _run_one returns but before we
+                # claim the next course. Do not clear that cancel event while
+                # advancing the queue, or the next course starts unexpectedly.
+                canceled_at_boundary = outcome == "ok" and self.cancel_event.is_set()
+                entry = (
+                    self._pop_next_queued_locked()
+                    if outcome == "ok" and not canceled_at_boundary
+                    else None
+                )
                 if entry is None:
+                    if canceled_at_boundary:
+                        self.status = "canceled"
+                        self.error = ""
                     self.running = False
                     self.pause_event.clear()
                     self.cancel_event.clear()
                     self.finished_at = time.time()
-                    return
+                    break
                 # Claim the next job while still holding the lock, so a cancel
                 # arriving now cannot leave `running` False with a live thread.
                 self.status = "running"
@@ -444,6 +595,8 @@ class DownloadJob:
             # Logged outside the lock: add_log() takes it, and threading.Lock is
             # not reentrant, so calling it under the lock above would deadlock.
             self.add_log("Queue: starting %s" % label)
+        if canceled_at_boundary:
+            self.add_log("Download canceled before the next queued course started.")
 
     def _run_one(self, command):
         """Execute a single command. Returns "ok" when the queue may advance.
@@ -455,6 +608,13 @@ class DownloadJob:
         handler = JobLogHandler(self)
         root_logger = logging.getLogger()
         root_logger.addHandler(handler)
+        with self.lock:
+            job_payload = dict(self.last_payload or {})
+        try:
+            speed_limit_kb = int(job_payload.get("speed_limit") or 0)
+        except (TypeError, ValueError):
+            speed_limit_kb = 0
+        set_speed_limit(max(0, speed_limit_kb) * 1024)
         set_download_control_events(self.cancel_event, self.pause_event)
         reset_progress()
         reset_file_status()
@@ -1717,8 +1877,6 @@ def build_download_command(payload, resume=False, item=None):
         raise ValueError(
             "Download speed must be between 0 (unlimited) and %d KB/s." % MAX_SPEED_LIMIT_KB
         )
-    set_speed_limit(speed_limit_kb * 1024)
-
     language_code = general.LANG_NAME_TO_CODE_MAPPING[language_name]
     class_names = [class_name]
     expand_in_downloader = False
@@ -2112,14 +2270,6 @@ def discover_downloaded_program_course_slugs(program_slug, selected_folder):
     return found
 
 
-def module_file_count(module):
-    """Count files across a scanned module's sections."""
-    total = 0
-    for section in module.get("sections", []) or []:
-        total += int(section.get("file_count") or 0)
-    return total
-
-
 def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0):
     scanned_modules = []
     loose_files = []
@@ -2157,12 +2307,10 @@ def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0)
         modules = scanned_modules
         downloadable_total = total_files
         expected_total = total_files
-        total_items = sum(module_file_count(module) for module in modules)
-        status = "downloaded" if total_items else ("missing" if not total_files else "partial")
+        status = "downloaded" if total_files else "missing"
         display_count = total_files
         loose = [
-            f"Found {total_files} file{'s' if total_files != 1 else ''} on disk. "
-            "The site tree manifest is not available, so this list comes from the folder."
+            f"Showing {total_files} file{'s' if total_files != 1 else ''} found in the course folder."
         ]
 
     if loose_files and site_tree:
@@ -2191,7 +2339,10 @@ def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0)
         "title": numbered_course_title(order_index, order_total, course_slug),
         "slug": course_slug,
         "status": status,
-        "tree_source": "site" if site_tree else "missing",
+        # This folder has already been scanned above. If the sidecar site-tree
+        # manifest is absent, identify the tree as folder-derived so the UI
+        # does not label a successfully scanned download as "Manifest missing".
+        "tree_source": "site" if site_tree else "folder",
         "path": str(course_folder),
         "file_count": display_count,
         "downloadable_count": downloadable_total,
@@ -2845,6 +2996,12 @@ class WebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/queue-resume":
                 self.queue_download(payload, resume=True)
                 return
+            if parsed.path == "/api/queue-batch":
+                self.queue_batch(payload)
+                return
+            if parsed.path == "/api/queue-start":
+                self.queue_start()
+                return
             if parsed.path == "/api/queue-remove":
                 self.queue_remove(payload)
                 return
@@ -2930,11 +3087,58 @@ class WebHandler(BaseHTTPRequestHandler):
         })
 
     def queue_download(self, payload, resume):
-        """Explicitly add a course to the queue, even while one is running."""
+        """Queue behind a running job, or start immediately when the queue is idle."""
         command, config = build_download_command(payload, resume=resume, item=None)
         save_config(config)
-        entry = JOB.enqueue(dict(payload), command, resume)
-        self.send_json({"ok": True, "queued": True, "entry_id": entry["id"], "status": JOB.snapshot()})
+        outcome, entry = JOB.start_or_queue(dict(payload), command, resume)
+        self.send_json({
+            "ok": True,
+            "queued": outcome == "queued",
+            "entry_id": (entry or {}).get("id"),
+            "status": JOB.snapshot(),
+        })
+
+    def queue_batch(self, payload):
+        courses = payload.get("courses")
+        if not isinstance(courses, list) or not courses:
+            raise ValueError("Paste at least one course link.")
+        if len(courses) > MAX_QUEUE_SIZE:
+            raise ValueError("Add no more than %d course links at a time." % MAX_QUEUE_SIZE)
+
+        common = dict(payload)
+        common.pop("courses", None)
+        prepared = []
+        last_config = None
+        for index, course in enumerate(courses, start=1):
+            if not isinstance(course, str) or not course.strip():
+                raise ValueError("Link %d is empty or invalid." % index)
+            item_payload = dict(common)
+            item_payload["course"] = course.strip()
+            try:
+                command, last_config = build_download_command(item_payload, resume=False)
+            except ValueError as exc:
+                raise ValueError("Link %d: %s" % (index, exc)) from exc
+            prepared.append((item_payload, command, False))
+
+        result = JOB.enqueue_batch(prepared)
+        if last_config is not None:
+            save_config(last_config)
+        started = result["started"]
+        added_ids = {entry["id"] for entry in result["added"]}
+        started_from_batch = bool(started and started["id"] in added_ids)
+        self.send_json({
+            "ok": True,
+            "added": len(result["added"]),
+            "queued": len(result["added"]) - (1 if started_from_batch else 0),
+            "started": started,
+            "status": JOB.snapshot(),
+        })
+
+    def queue_start(self):
+        entry = JOB.start_next_queued()
+        if entry is None:
+            raise ValueError("There are no queued courses to start.")
+        self.send_json({"ok": True, "started_id": entry["id"], "status": JOB.snapshot()})
 
     def queue_remove(self, payload):
         entry_id = payload.get("entry_id")
@@ -3039,10 +3243,13 @@ class WebHandler(BaseHTTPRequestHandler):
         if JOB.running_course(payload.get("course", ""), download_path):
             try:
                 JOB.cancel()
-                stopped = True
             except RuntimeError:
                 pass
-            JOB.wait_for_stop(timeout=10)
+            if not JOB.wait_for_stop(timeout=10):
+                raise ValueError(
+                    "The download is still stopping. Wait for it to finish before deleting this course."
+                )
+            stopped = True
 
         summary = delete_course_folder(target, download_path)
         JOB.add_log(
@@ -3166,29 +3373,48 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_json({"profiles": profiles, "selected": load_stored_profile()})
 
     def origin_is_allowed(self):
-        host_header = self.headers.get("Host", "")
+        port = self.server.server_port
+        allowed_hosts = {
+            "localhost:%d" % port,
+            "127.0.0.1:%d" % port,
+            "[::1]:%d" % port,
+        }
+        if port == 80:
+            allowed_hosts.update({"localhost", "127.0.0.1", "[::1]"})
+        host_header = self.headers.get("Host", "").lower()
+        if host_header not in allowed_hosts:
+            return False
+
         origin = self.headers.get("Origin", "")
         referer = self.headers.get("Referer", "")
-        if origin:
-            try:
-                origin_host = urlparse(origin).netloc
-            except ValueError:
-                return False
-            return origin_host == host_header
-        if referer:
-            try:
-                referer_host = urlparse(referer).netloc
-            except ValueError:
-                return False
-            return referer_host == host_header
-        return True
+        source = origin or referer
+        if not source:
+            return False
+        try:
+            parsed = urlparse(source)
+        except ValueError:
+            return False
+        return parsed.scheme == "http" and parsed.netloc.lower() in allowed_hosts
 
     def read_json(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid request body length.") from exc
+        if length < 0:
+            raise ValueError("Invalid request body length.")
+        if length == 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw)
+        if length > 1024 * 1024:
+            raise ValueError("Request body is too large.")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Request body must be valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return payload
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")

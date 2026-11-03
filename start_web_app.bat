@@ -101,7 +101,7 @@ if errorlevel 1 (
 
 :deps_ok
 echo Checking for an old web app on port 7500...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$connections = Get-NetTCPConnection -LocalPort 7500 -State Listen -ErrorAction SilentlyContinue; foreach ($connection in $connections) { if ($connection.OwningProcess) { Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue } }; Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort 7500 -State Listen -ErrorAction SilentlyContinue) { exit 3 } else { exit 0 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -LocalPort 7500 -State Listen -ErrorAction SilentlyContinue) { exit 3 } else { exit 0 }"
 if not errorlevel 3 goto collect_args
 
 if defined ELEVATED (
