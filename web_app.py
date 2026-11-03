@@ -20,6 +20,56 @@ import string
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Python version guard.
+#
+# rookiepy decrypts browser cookies through a Rust extension whose newest
+# release (0.5.6) only ships Windows wheels for Python 3.7-3.12. On 3.13+ pip
+# tries to compile it from source and fails inside PyO3 with a wall of Rust
+# output that says nothing about the real problem. Fail early and say so.
+# ---------------------------------------------------------------------------
+MIN_PYTHON = (3, 8)
+MAX_PYTHON_EXCLUSIVE = (3, 13)
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _check_python_version():
+    current = sys.version_info[:2]
+    if MIN_PYTHON <= current < MAX_PYTHON_EXCLUSIVE:
+        return
+    lines = [
+        "",
+        "=" * 68,
+        "This app cannot run on Python %d.%d." % current,
+        "",
+        "The browser-cookie library it depends on (rookiepy) only supports",
+        "Python %d.%d to %d.%d. Newer versions do not exist yet." % (
+            MIN_PYTHON[0], MIN_PYTHON[1],
+            MAX_PYTHON_EXCLUSIVE[0], MAX_PYTHON_EXCLUSIVE[1] - 1,
+        ),
+        "",
+        "You are probably running a stray Python from PATH instead of your",
+        "Anaconda environment. Fix it with one of these:",
+        "",
+        "  Anaconda (recommended):",
+        "    Start menu -> Anaconda Prompt",
+        "    conda activate coursera_env",
+        "    cd /d %s" % APP_ROOT,
+        "    start_web_app.bat",
+        "",
+        "  Or point Python at the right interpreter directly:",
+        "    conda run -n coursera_env python web_app.py",
+        "",
+        "Check what you are running with:  python --version",
+        "=" * 68,
+        "",
+    ]
+    sys.stderr.write("\n".join(lines))
+    raise SystemExit(2)
+
+
+_check_python_version()
+
 import general
 from app_version import __version__
 from coursera_dl import main_f

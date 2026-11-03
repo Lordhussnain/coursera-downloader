@@ -18,11 +18,14 @@ rem   3. python.exe found on PATH          (any installed Python)
 rem   4. python.exe of a conda env that was created earlier
 rem An activated environment wins over a leftover .venv folder, because
 rem "conda activate" is an explicit choice and a stale .venv would otherwise
-rem hijack the run. If none of them has the requirements, the first Python 3.8+
-rem found is used and the requirements are installed into it.
+rem hijack the run. If none of them has the requirements, the first supported
+rem Python found (3.8 - 3.12) is used and the requirements are installed into it.
+rem Python 3.13 and newer are skipped on purpose: rookiepy has no wheel for them,
+rem so pip would try to build a Rust extension and fail with a confusing error.
 rem ---------------------------------------------------------------------------
 set "PYTHON="
 set "PYTHON_FALLBACK="
+set "PYTHON_TOO_NEW="
 set "PYTHON_KIND="
 
 if not defined CONDA_PREFIX goto skip_conda
@@ -61,6 +64,17 @@ for /d %%E in ("%USERPROFILE%\miniconda3\envs\*") do if not defined PYTHON call 
 if defined PYTHON goto have_python
 
 for /d %%E in ("%ProgramData%\anaconda3\envs\*") do if not defined PYTHON call :probe "%%~fE\python.exe"
+if defined PYTHON goto have_python
+
+rem Base installs, for people who never created a named environment.
+for %%B in (
+  "%USERPROFILE%\anaconda3\python.exe"
+  "%USERPROFILE%\miniconda3\python.exe"
+  "%USERPROFILE%\miniforge3\python.exe"
+  "%ProgramData%\anaconda3\python.exe"
+  "%ProgramData%\miniconda3\python.exe"
+  "%LOCALAPPDATA%\anaconda3\python.exe"
+) do if not defined PYTHON call :probe "%%~B"
 if defined PYTHON goto have_python
 
 if defined PYTHON_FALLBACK set "PYTHON=%PYTHON_FALLBACK%"
@@ -127,8 +141,26 @@ if errorlevel 1 (
 exit /b
 
 :no_python
-echo No Python interpreter was found.
-echo.
+if defined PYTHON_TOO_NEW (
+  echo A Python that is too new was found:
+  echo   %PYTHON_TOO_NEW%
+  echo.
+  echo This app needs Python 3.8 to 3.12 because its browser-cookie library
+  echo does not support newer versions yet. Use your Anaconda environment:
+  echo.
+  echo   Start menu -^> Anaconda Prompt
+  echo   conda activate coursera_env
+  echo   start_web_app.bat
+  echo.
+  echo If that environment does not exist yet:
+  echo   conda create -n coursera_env python=3.10 -y
+  echo   conda activate coursera_env
+  echo   python -m pip install -r requirements.txt
+  echo.
+  pause
+  exit /b 1
+)
+echo No usable Python interpreter was found.
 echo Install Python 3.8+ from https://www.python.org/downloads/ and tick
 echo "Add python.exe to PATH", or create a virtual environment:
 echo   python -m venv .venv
@@ -147,13 +179,23 @@ exit /b 1
 
 rem ---------------------------------------------------------------------------
 rem :probe <python path>
-rem Sets PYTHON when the interpreter is Python 3.8+ and has the requirements.
-rem Otherwise remembers the first Python 3.8+ interpreter as a fallback.
+rem Sets PYTHON when the interpreter is Python 3.8-3.12 and has the requirements.
+rem Otherwise remembers the first usable interpreter as a fallback.
+rem
+rem The upper bound is not arbitrary: rookiepy (browser cookies) only ships
+rem wheels up to Python 3.12, so 3.13+ would try to compile a Rust extension
+rem from source and fail. Rejecting it here keeps a stray new Python on PATH
+rem from being chosen over a perfectly good Anaconda environment.
 rem ---------------------------------------------------------------------------
 :probe
 if not exist "%~1" exit /b 1
-"%~1" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
-if errorlevel 1 exit /b 1
+"%~1" -c "import sys; sys.exit(0 if (3, 8) <= sys.version_info[:2] < (3, 13) else 1)" >nul 2>&1
+if errorlevel 1 (
+  rem Remember a too-new interpreter only to explain the problem later.
+  "%~1" -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 13) else 1)" >nul 2>&1
+  if not errorlevel 1 if not defined PYTHON_TOO_NEW set "PYTHON_TOO_NEW=%~1"
+  exit /b 1
+)
 "%~1" -c "import requests, bs4, rookiepy" >nul 2>&1
 if errorlevel 1 (
   if not defined PYTHON_FALLBACK set "PYTHON_FALLBACK=%~1"

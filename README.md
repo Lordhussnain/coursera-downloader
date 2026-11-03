@@ -57,9 +57,22 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 
 # Installation and Setup
 
-1. Ensure you have Python 3.8+ installed.
+1. Ensure you have **Python 3.8 - 3.12** installed (3.10 is what this project targets). Python 3.13 and newer **do not work** - see [Python version](#python-version) below.
 2. Clone the repository and navigate to the directory.
-3. Install dependencies: `pip install -r requirements.txt`
+3. Install dependencies: `python -m pip install -r requirements.txt`
+
+### Python version
+
+| Python | Works? | Why |
+| --- | --- | --- |
+| 3.8 - 3.12 | Yes | Every dependency ships a ready-made wheel, including the browser-cookie library. |
+| 3.10 | Recommended | The version in `requirements.txt` and in the setup script. |
+| 3.13 / 3.14 / 3.15 | **No** | `rookiepy` (reads cookies from Chrome, Edge, Firefox) publishes no wheel past 3.12. `pip` then tries to compile it from source and fails inside PyO3, and `pillow==11.0.0` has no matching wheel either - you get a long Rust build error that never names the real cause. |
+
+`start_web_app.bat` therefore **skips interpreters newer than 3.12** when it looks
+for the one to run, and `web_app.py` refuses to start on one with a short
+explanation instead of a traceback. If your newest Python is 3.15 but you have an
+Anaconda environment, the launcher will pick the environment and ignore the 3.15.
 
 A virtual environment is optional. `start_web_app.bat` picks an interpreter automatically, in this order:
 
@@ -72,12 +85,17 @@ If the chosen interpreter is missing packages it runs `pip install -r requiremen
 
 ## Running with Anaconda (Windows)
 
-Open the **Anaconda Prompt** from the Start menu (not the plain `cmd` window, which does not know the `conda` command unless you ran `conda init cmd.exe`):
+The quickest route: double-click **`setup_env.bat`** once. It finds conda, creates
+a `coursera_env` environment on Python 3.10, installs the requirements, and
+verifies they import. Then just double-click `start_web_app.bat` - it picks that
+environment up by itself, no activation needed.
+
+To do the same steps by hand, open the **Anaconda Prompt** from the Start menu (not the plain `cmd` window, which does not know the `conda` command unless you ran `conda init cmd.exe`):
 
 ```bat
 conda create -n coursera_env python=3.10 -y
 conda activate coursera_env
-cd /d C:\Users\<you>\Desktop\coursera\coursera-downloader
+cd /d C:\Users\<you>\corsera-down\coursera-downloader
 python -m pip install -r requirements.txt
 start_web_app.bat
 ```
@@ -110,6 +128,9 @@ Notes:
 | Port 7500 already in use | An earlier instance is still running. Close its console window, or run `python web_app.py --port 7501`. |
 | Browser shows an old UI after updating | Press `Ctrl+Shift+R` to bypass the cached CSS/JS. |
 | `pip` is slow or fails | `python -m pip install --upgrade pip` then retry, or add `-i https://pypi.org/simple`. |
+| Long Rust/Cargo error or `RequiredDependencyException: zlib` while installing | Your Python is 3.13+. `rookiepy` has no wheel past 3.12. See [Python version](#python-version) - run `setup_env.bat`, or `conda create -n coursera_env python=3.10 -y`. |
+| `Defaulting to user installation` in pip output | pip is installing into a stray Python (e.g. `AppData\Roaming\Python\Python315`), not your environment. Activate the environment first, then use `python -m pip`. |
+| `This app cannot run on Python 3.15` | Working as intended. Start it through `start_web_app.bat`, which picks the 3.10 environment, or `conda run -n coursera_env python web_app.py`. |
 
 # Usage
 
@@ -163,7 +184,7 @@ environment as the app:
 
 ```bat
 conda activate coursera_env
-cd /d C:\Users\shah\Desktop\coursera\coursera-downloader
+cd /d C:\Users\shah\corsera-down\coursera-downloader
 python diagnose_cookies.py
 ```
 
