@@ -1879,12 +1879,19 @@ def build_quick_activity(class_name, is_multi_course_program, selected_folder):
         site_tree = load_site_tree(course_slug, project_root)
         course_folder = find_existing_course_folder(course_slug, project_root)
         if not site_tree:
+            if course_folder:
+                # The course is on disk, only the manifest is gone. Scanning the
+                # folder is the quick path too: it is a directory walk, not a
+                # network call, and it stops a finished course from being
+                # labelled "missing".
+                groups.append(scan_course_folder(course_slug, course_folder, index, course_total))
+                continue
             groups.append({
                 "title": numbered_course_title(index, course_total, course_slug),
                 "slug": course_slug,
-                "status": "manifest-missing",
+                "status": "missing",
                 "tree_source": "missing",
-                "path": str(course_folder or ""),
+                "path": "",
                 "file_count": 0,
                 "downloadable_count": 0,
                 "expected_count": 0,
@@ -1892,8 +1899,8 @@ def build_quick_activity(class_name, is_multi_course_program, selected_folder):
                 "order_total": course_total,
                 "modules": [],
                 "loose": [
-                    "Site tree manifest is missing. Refresh/resume this course to create "
-                    f"{course_slug}-site-tree.json."
+                    "This course has not been downloaded yet. "
+                    f"No folder and no {course_slug}-site-tree.json were found."
                 ],
             })
             continue
@@ -2009,13 +2016,13 @@ def build_downloaded_activity(class_name, is_multi_course_program, selected_fold
                 modules, downloaded_items, downloadable_total, expected_total = [], 0, 0, 0
                 tree_source = "missing"
                 loose = [
-                    "Site tree manifest is missing. Refresh/resume this course to create "
-                    f"{course_slug}-site-tree.json. Folder scan fallback is disabled."
+                    "This course has not been downloaded yet. "
+                    f"No folder and no {course_slug}-site-tree.json were found."
                 ]
             groups.append({
                 "title": numbered_course_title(index, course_total, course_slug),
                 "slug": course_slug,
-                "status": "missing" if site_tree else "manifest-missing",
+                "status": "missing",
                 "tree_source": tree_source,
                 "path": "",
                 "file_count": downloaded_items,
@@ -2105,6 +2112,14 @@ def discover_downloaded_program_course_slugs(program_slug, selected_folder):
     return found
 
 
+def module_file_count(module):
+    """Count files across a scanned module's sections."""
+    total = 0
+    for section in module.get("sections", []) or []:
+        total += int(section.get("file_count") or 0)
+    return total
+
+
 def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0):
     scanned_modules = []
     loose_files = []
@@ -2135,14 +2150,19 @@ def scan_course_folder(course_slug, course_folder, order_index=0, order_total=0)
             f"{total_files} real file{'s' if total_files != 1 else ''} on disk."
         ]
     else:
-        modules = []
-        downloadable_total = 0
-        expected_total = 0
-        status = "manifest-missing"
-        display_count = 0
+        # No manifest, but the course folder is right there and it was already
+        # scanned above. Report what is actually on disk instead of claiming the
+        # download is missing: a course downloaded on another machine (or before
+        # the manifest was written) is still perfectly complete.
+        modules = scanned_modules
+        downloadable_total = total_files
+        expected_total = total_files
+        total_items = sum(module_file_count(module) for module in modules)
+        status = "downloaded" if total_items else ("missing" if not total_files else "partial")
+        display_count = total_files
         loose = [
-            "Site tree manifest is missing. Refresh/resume this course to create "
-            f"{course_slug}-site-tree.json. Folder scan fallback is disabled."
+            f"Found {total_files} file{'s' if total_files != 1 else ''} on disk. "
+            "The site tree manifest is not available, so this list comes from the folder."
         ]
 
     if loose_files and site_tree:

@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.8.2
+- **A downloaded course no longer claims its manifest is missing.** When
+  `-site-tree.json` was not next to the course folder, the tree was reported as
+  `manifest-missing` with a file count of **0**, even though every file was on
+  disk. The folder scan result was computed and then thrown away.
+- Both the full and the quick (first-poll) code paths now fall back to the folder
+  listing, so the course shows as downloaded with its real file count and its
+  tree is rebuilt from disk. The note simply says the list came from the folder.
+- A course with no folder and no manifest now reports "not downloaded yet"
+  instead of blaming a missing manifest.
+- An existing but empty folder is reported as not started rather than downloaded.
+- The old `manifest-missing` label, kept only for compatibility, now reads
+  "Downloaded (no manifest)".
+
 ## v3.8.1
 - **Back to the course list.** Opening a recent course showed its tree and log
   with no way to return to the list and choose another one. A **← All courses**

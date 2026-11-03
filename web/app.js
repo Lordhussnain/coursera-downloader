@@ -1652,7 +1652,10 @@ function statusText(status, fileCount = null) {
   if (status === "canceling") return "Canceling";
   if (status === "canceled") return "Canceled";
   if (status === "failed") return "Failed";
-  if (status === "manifest-missing") return "Manifest missing";
+  // "manifest-missing" is only kept for older servers: a downloaded course
+  // reports "downloaded" from the folder scan, so this label should never
+  // appear for a course that is actually on disk.
+  if (status === "manifest-missing") return "Downloaded (no manifest)";
   if (status === "manifest") return "Loading…";
   if (status === "pending") return "Loading…";
   if (status === "running") return "Running";

@@ -131,6 +131,7 @@ Notes:
 | Long Rust/Cargo error or `RequiredDependencyException: zlib` while installing | Your Python is 3.13+. `rookiepy` has no wheel past 3.12. See [Python version](#python-version) - run `setup_env.bat`, or `conda create -n coursera_env python=3.10 -y`. |
 | `Defaulting to user installation` in pip output | pip is installing into a stray Python (e.g. `AppData\Roaming\Python\Python315`), not your environment. Activate the environment first, then use `python -m pip`. |
 | `This app cannot run on Python 3.15` | Working as intended. Start it through `start_web_app.bat`, which picks the 3.10 environment, or `conda run -n coursera_env python web_app.py`. |
+| A finished course says "Manifest missing" | Fixed in v3.8.2 - the tree is rebuilt from the folder when the manifest is absent. If you are on an older build, delete the course from the list and re-add it, or press **Retry missing**. |
 
 # Usage
 
