@@ -4,14 +4,17 @@
 Manages the credential information (passwords, etc).
 """
 
-import logging
 import os
-import platform
 
 
-class CredentialsError(BaseException):
+class CredentialsError(Exception):
     """
     Class to be thrown if the credentials are not found.
+
+    This deliberately derives from ``Exception`` rather than
+    ``BaseException``: as a ``BaseException`` it slipped past every
+    ``except Exception`` handler in the app and surfaced as an
+    unhandled crash instead of a friendly message.
     """
 
     pass

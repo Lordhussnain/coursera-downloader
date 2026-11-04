@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Coursera Downloader</title>
-    <link rel="stylesheet" href="/styles.css?v=20260503-precollect-syllabus">
+    <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <main class="app-shell">
@@ -60,6 +60,12 @@
                   <label for="subtitle_language">Subtitle language</label>
                   <select id="subtitle_language" name="subtitle_language"></select>
                 </div>
+
+                <div class="field">
+                  <label for="jobs">Parallel downloads</label>
+                  <select id="jobs" name="jobs"></select>
+                  <p class="hint">More files at once is faster, but a high number can trip Coursera's rate limits.</p>
+                </div>
               </div>
             </div>
           </section>
@@ -89,6 +95,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260503-no-fallback-tree"></script>
+    <script src="/app.js"></script>
   </body>
 </html>

@@ -1,10 +1,12 @@
 import argparse
 import base64
+import errno
 import html
 import json
 import logging
 import mimetypes
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -31,6 +33,94 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 TREE_DEBUG = os.environ.get("COURSERA_DOWNLOADER_TREE_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
+# Only these hostnames may drive the API by default. Comparing Origin against
+# Host is not enough on its own: during a DNS-rebinding attack the browser sees
+# the attacker's domain as same-origin, so both headers match and the request
+# sails through. Validating Host against a loopback allowlist closes that hole.
+LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "[::]", "::", "*"})
+ALLOWED_HOSTS_ENV_VAR = "COURSERA_DOWNLOADER_ALLOWED_HOSTS"
+
+# Upper bound for a JSON request body. The API only ever receives small form
+# payloads, so this is generous while still preventing an unbounded read.
+MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024
+
+# The folder dialog is modal and user-driven, so give it room but do not let a
+# stuck dialog hold the request thread open forever.
+FOLDER_PICKER_TIMEOUT = 300
+
+FOLDER_PICKER_UNAVAILABLE = (
+    "No folder picker is available on this system. "
+    "Type the full download folder path into the field instead."
+)
+
+# Concurrent downloads. coursera_dl only engages its ParallelDownloader when
+# --jobs is greater than 1, so the previous hardcoded "1" meant the app always
+# downloaded sequentially no matter what the documentation claimed.
+DEFAULT_PARALLEL_JOBS = 3
+MIN_PARALLEL_JOBS = 1
+MAX_PARALLEL_JOBS = 8
+
+
+def parse_parallel_jobs(value):
+    """Validate a submitted jobs value, clamping it into the supported range."""
+    if value is None or str(value).strip() == "":
+        return DEFAULT_PARALLEL_JOBS
+    try:
+        jobs = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Parallel downloads must be a whole number between "
+            f"{MIN_PARALLEL_JOBS} and {MAX_PARALLEL_JOBS}."
+        ) from None
+    return max(MIN_PARALLEL_JOBS, min(MAX_PARALLEL_JOBS, jobs))
+
+
+def stored_parallel_jobs(argdict):
+    """Read the persisted jobs value, falling back rather than raising."""
+    try:
+        return parse_parallel_jobs(argdict.get("jobs"))
+    except ValueError:
+        return DEFAULT_PARALLEL_JOBS
+
+
+def host_header_name(value):
+    """Return the hostname part of a Host header, dropping any port."""
+    name = (value or "").strip().lower()
+    if not name:
+        return ""
+    if name.startswith("["):  # IPv6 literal, e.g. [::1]:7500
+        closing = name.find("]")
+        return name[: closing + 1] if closing != -1 else name
+    head, _, tail = name.rpartition(":")
+    if head and tail.isdigit():
+        return head
+    return name
+
+
+def build_allowed_hosts(bind_host, extra_hosts=()):
+    """Build the set of Host header values this server will accept."""
+    allowed = set(LOOPBACK_HOSTNAMES)
+
+    normalized_bind = host_header_name(bind_host)
+    if normalized_bind and normalized_bind not in WILDCARD_BIND_HOSTS:
+        allowed.add(normalized_bind)
+
+    for entry in extra_hosts:
+        for part in str(entry).split(","):
+            name = host_header_name(part)
+            if name:
+                allowed.add(name)
+
+    return allowed
+
+
+def allowed_hosts_from_environment():
+    """Extra allowed hosts from COURSERA_DOWNLOADER_ALLOWED_HOSTS (comma separated)."""
+    raw = os.environ.get(ALLOWED_HOSTS_ENV_VAR, "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 
 def disable_console_quick_edit():
     if os.name != "nt":
@@ -50,6 +140,55 @@ def disable_console_quick_edit():
         kernel32.SetConsoleMode(handle, new_mode)
     except Exception:
         logging.debug("Could not disable console QuickEdit mode.", exc_info=True)
+
+
+class ApiError(Exception):
+    """An error whose message is safe to show the user.
+
+    Carries the HTTP status the API should reply with, so expected failure
+    conditions stop being reported as 500 Internal Server Error.
+    """
+
+    status = 400
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        if status is not None:
+            self.status = status
+
+
+class JobStateError(ApiError, RuntimeError):
+    """A job action that does not match the current job state.
+
+    Also derives from RuntimeError so existing ``except RuntimeError`` callers
+    keep working. Replies 409 Conflict: the request was understood, it just
+    cannot be applied right now.
+    """
+
+    status = 409
+
+
+class PayloadTooLargeError(ApiError):
+    """The request body exceeded the accepted limit."""
+
+    status = 413
+
+
+class MalformedRequestError(ApiError):
+    """The request body could not be parsed."""
+
+    status = 400
+
+
+class AuthDetectionError(ApiError, RuntimeError):
+    """No Coursera login could be detected in the user's browsers.
+
+    This is a normal, user-actionable state rather than a server fault, so it
+    is reported as 400 with its guidance intact. Derives from RuntimeError so
+    existing ``except RuntimeError`` callers keep working.
+    """
+
+    status = 400
 
 
 class JobLogHandler(logging.Handler):
@@ -109,7 +248,7 @@ class DownloadJob:
     def retry_request(self):
         with self.lock:
             if self.last_payload is None:
-                raise RuntimeError("No previous download request to retry.")
+                raise JobStateError("No previous download request to retry.")
             return dict(self.last_payload), self.last_resume
 
     def has_request_for(self, course_input, download_path):
@@ -123,7 +262,7 @@ class DownloadJob:
     def start(self, command):
         with self.lock:
             if self.running:
-                raise RuntimeError("A download is already running.")
+                raise JobStateError("A download is already running.")
             self.running = True
             self.status = "running"
             self.error = ""
@@ -140,9 +279,9 @@ class DownloadJob:
     def pause(self):
         with self.lock:
             if not self.running:
-                raise RuntimeError("No download is running.")
+                raise JobStateError("No download is running.")
             if self.status == "canceling":
-                raise RuntimeError("Download is already canceling.")
+                raise JobStateError("Download is already canceling.")
             self.pause_event.set()
             self.status = "paused"
         self.add_log("Download paused.")
@@ -150,7 +289,7 @@ class DownloadJob:
     def resume(self):
         with self.lock:
             if not self.running:
-                raise RuntimeError("No download is running.")
+                raise JobStateError("No download is running.")
             self.pause_event.clear()
             self.status = "running"
         self.add_log("Download resumed.")
@@ -158,7 +297,7 @@ class DownloadJob:
     def cancel(self):
         with self.lock:
             if not self.running:
-                raise RuntimeError("No download is running.")
+                raise JobStateError("No download is running.")
             self.cancel_event.set()
             self.pause_event.clear()
             self.status = "canceling"
@@ -254,9 +393,10 @@ def detect_cauth_cookie():
     try:
         import rookiepy
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
+        raise ApiError(
             "Missing dependency: rookiepy. Install dependencies with "
-            "python -m pip install -r requirements.txt, then restart the app."
+            "python -m pip install -r requirements.txt, then restart the app.",
+            status=500,
         ) from exc
 
     errors = []
@@ -284,7 +424,7 @@ def detect_cauth_cookie():
         errors.append(f"{browser}: CAUTH cookie not found")
 
     detail = "; ".join(errors) if errors else "No supported browser cookie reader was available."
-    raise RuntimeError(auth_detection_error_message(detail))
+    raise AuthDetectionError(auth_detection_error_message(detail))
 
 
 def detect_auth_status():
@@ -631,29 +771,96 @@ def choose_download_folder(initial_path):
     if not initial_dir.exists():
         initial_dir = initial_dir.parent if initial_dir.parent.exists() else Path.home()
 
+    try:
+        return _choose_folder_tkinter(initial_dir)
+    except ImportError:
+        logging.debug("tkinter is unavailable; trying platform fallbacks.", exc_info=True)
+    except Exception:
+        # No DISPLAY, missing Tcl/Tk, and similar all land here.
+        logging.debug("tkinter folder dialog failed.", exc_info=True)
+
+    selected = _choose_folder_powershell(initial_dir)
+    if selected is None:
+        # Surface as a 400 with guidance rather than a bare 500 traceback.
+        raise ValueError(FOLDER_PICKER_UNAVAILABLE)
+    return selected
+
+
+def _choose_folder_tkinter(initial_dir):
+    """Native folder dialog via tkinter. Raises ImportError when unavailable."""
     import tkinter as tk
     from tkinter import filedialog
 
     root = tk.Tk()
     root.withdraw()
-    root.attributes("-topmost", True)
     try:
-        selected = filedialog.askdirectory(
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    try:
+        return filedialog.askdirectory(
             title="Select download folder",
             initialdir=str(initial_dir),
         )
     finally:
-        root.destroy()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
 
-    return selected
+
+def _choose_folder_powershell(initial_dir):
+    """Windows fallback for installs without tkinter.
+
+    Returns the chosen path, "" when the user cancels, or None if the dialog
+    could not be shown at all.
+    """
+    if os.name != "nt":
+        return None
+
+    # In a single-quoted PowerShell string, ' is escaped by doubling it.
+    escaped = str(initial_dir).replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
+        f"$dialog.SelectedPath = '{escaped}';"
+        "$dialog.Description = 'Select download folder';"
+        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {"
+        "[Console]::Out.Write($dialog.SelectedPath)"
+        "}"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-STA",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=FOLDER_PICKER_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        logging.debug("PowerShell folder dialog failed.", exc_info=True)
+        return None
+
+    if completed.returncode != 0:
+        logging.debug("PowerShell folder dialog exited %s", completed.returncode)
+        return None
+    return completed.stdout.strip()
 
 
 def build_download_command(payload, resume=False, item=None):
-    detected_browser, cauth_cookie, _ = detect_cauth_cookie()
     course_input = payload.get("course", "").strip()
     download_path = payload.get("path", "").strip()
     resolution = payload.get("video_resolution", "720p").strip()
     language_name = payload.get("subtitle_language", "English").strip()
+    jobs = parse_parallel_jobs(payload.get("jobs"))
 
     class_name, is_multi_course_program = general.parse_course_input(course_input)
     if not class_name:
@@ -687,6 +894,11 @@ def build_download_command(payload, resume=False, item=None):
     if language_name not in general.LANG_NAME_TO_CODE_MAPPING:
         raise ValueError("Choose a valid subtitle language.")
 
+    # Detected only once the payload has been validated. Doing it first meant a
+    # user who mistyped a URL was told their browser login could not be found,
+    # which sent them debugging the wrong thing.
+    detected_browser, cauth_cookie, _ = detect_cauth_cookie()
+
     migrate_legacy_program_layout(class_name, is_multi_course_program, download_folder)
     project_root = project_folder(class_name, is_multi_course_program, download_folder)
     try:
@@ -717,7 +929,7 @@ def build_download_command(payload, resume=False, item=None):
         "--combined-section-lectures-nums",
         "--cache-syllabus",
         "--jobs",
-        "1",
+        str(jobs),
     ]
 
     if is_multi_course_program and len(class_names) > 1:
@@ -742,12 +954,14 @@ def build_download_command(payload, resume=False, item=None):
     return command, {
         "browser": detected_browser,
         "argdict": {
+            # The CAUTH cookie is deliberately never persisted; it is detected
+            # fresh from the browser on every run.
             "ca": "",
             "classname": course_input,
             "path": str(download_folder),
             "video_resolution": resolution,
             "sl": language_code,
-            "ca": "",
+            "jobs": jobs,
         },
     }
 
@@ -1735,7 +1949,9 @@ def load_config():
             "path": saved_path or str(default_download_folder()),
             "video_resolution": argdict.get("video_resolution", "720p"),
             "subtitle_language": language_name,
+            "jobs": stored_parallel_jobs(argdict),
         },
+        "jobs_range": {"min": MIN_PARALLEL_JOBS, "max": MAX_PARALLEL_JOBS},
     }
 
 
@@ -1752,6 +1968,9 @@ class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         logging.debug("GET %s", parsed.path)
+        if not self.host_is_allowed():
+            self.send_json({"error": "Request rejected: unrecognized Host header."}, status=403)
+            return
         if parsed.path == "/api/config":
             self.send_json(load_config())
             return
@@ -1763,6 +1982,9 @@ class WebHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         logging.debug("POST %s", parsed.path)
+        if not self.host_is_allowed():
+            self.send_json({"error": "Request rejected: unrecognized Host header."}, status=403)
+            return
         if not self.origin_is_allowed():
             self.send_json({"error": "Cross-origin request rejected."}, status=403)
             return
@@ -1808,10 +2030,15 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.check_auth()
                 return
             self.send_json({"error": "Not found"}, status=404)
+        except ApiError as exc:
+            # Expected conditions: wrong job state, oversized or unparsable body.
+            self.send_json({"error": str(exc)}, status=exc.status)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
-        except Exception as exc:
-            self.send_json({"error": str(exc)}, status=500)
+        except Exception:
+            # Keep internals in the server log, not in the client's hands.
+            logging.debug("Unhandled error on POST %s", parsed.path, exc_info=True)
+            self.send_json({"error": "Unexpected server error."}, status=500)
 
     def start_download(self, payload, resume, item=None):
         remembered_payload = dict(payload)
@@ -1895,6 +2122,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 "message": message,
             }, status=200)
 
+    def host_is_allowed(self):
+        """Reject requests whose Host header is not a loopback/allowlisted name."""
+        allowed = getattr(self.server, "allowed_hosts", None) or LOOPBACK_HOSTNAMES
+        return host_header_name(self.headers.get("Host", "")) in allowed
+
     def origin_is_allowed(self):
         host_header = self.headers.get("Host", "")
         origin = self.headers.get("Origin", "")
@@ -1914,11 +2146,41 @@ class WebHandler(BaseHTTPRequestHandler):
         return True
 
     def read_json(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            raise MalformedRequestError("Invalid Content-Length header.") from None
+
+        if length < 0:
+            raise MalformedRequestError("Invalid Content-Length header.")
+        if length == 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw)
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise PayloadTooLargeError(
+                f"Request body is too large (limit {MAX_REQUEST_BODY_BYTES // 1024} KiB)."
+            )
+
+        try:
+            raw = self.rfile.read(length)
+        except OSError as exc:
+            raise MalformedRequestError("Could not read the request body.") from exc
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise MalformedRequestError("Request body must be UTF-8 encoded JSON.") from None
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            # Deliberately vague: the parser's internals are not the client's
+            # business and would only leak implementation detail.
+            raise MalformedRequestError("Request body must be valid JSON.") from None
+
+        if not isinstance(payload, dict):
+            raise MalformedRequestError("Request body must be a JSON object.")
+        return payload
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
@@ -1956,6 +2218,22 @@ class WebHandler(BaseHTTPRequestHandler):
         logging.debug("%s - %s", self.address_string(), format % args)
 
 
+def shutdown_job(timeout=10):
+    """Ask a running download to stop and give it a moment to wind down."""
+    if not JOB.running:
+        return
+    print("Stopping the running download...")
+    try:
+        JOB.cancel()
+    except (ApiError, RuntimeError):
+        return
+    deadline = time.time() + timeout
+    while JOB.running and time.time() < deadline:
+        time.sleep(0.2)
+    if JOB.running:
+        print("Download did not stop in time; exiting anyway.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the Coursera Downloader web app.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1963,6 +2241,17 @@ def main(argv=None):
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--startup-delay", default=0, type=float)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOSTNAME",
+        help=(
+            "Extra Host header value to accept, for reverse proxies or LAN access. "
+            "Repeatable; loopback names are always allowed. Can also be set with the "
+            f"{ALLOWED_HOSTS_ENV_VAR} environment variable (comma separated)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.startup_delay > 0:
@@ -1970,13 +2259,65 @@ def main(argv=None):
 
     disable_console_quick_edit()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(message)s")
-    server = ThreadingHTTPServer((args.host, args.port), WebHandler)
+
+    allowed_hosts = build_allowed_hosts(
+        args.host, [*args.allowed_host, *allowed_hosts_from_environment()]
+    )
+
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), WebHandler)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EADDRINUSE:
+            print(
+                f"Port {args.port} is already in use.\n"
+                "Another copy of the app may still be running. Close it, or start "
+                "this one on a different port:\n"
+                f"  python web_app.py --port {args.port + 1}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Could not start the web server: {exc}", file=sys.stderr)
+        return 1
+
+    server.allowed_hosts = allowed_hosts
+
     url = f"http://{args.host}:{args.port}/"
     print(f"Coursera Downloader web app running at {url}")
+    print(f"Accepting Host headers: {', '.join(sorted(allowed_hosts))}")
+
+    stop_event = threading.Event()
+
+    def request_shutdown(signum=None, _frame=None):
+        if stop_event.is_set():
+            return
+        stop_event.set()
+        # shutdown() must not run on the signal handler's thread: it waits for
+        # serve_forever() to notice, which would deadlock.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    # SIGBREAK is Windows-only; the others cover POSIX and Ctrl+C everywhere.
+    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        signal_number = getattr(signal, signal_name, None)
+        if signal_number is None:
+            continue
+        try:
+            signal.signal(signal_number, request_shutdown)
+        except (ValueError, OSError):
+            logging.debug("Could not install a handler for %s.", signal_name, exc_info=True)
+
     if not args.no_browser:
         webbrowser.open(url)
-    server.serve_forever()
+
+    try:
+        server.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        request_shutdown()
+    finally:
+        shutdown_job()
+        server.server_close()
+        print("Coursera Downloader web app stopped.")
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))

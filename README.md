@@ -4,7 +4,9 @@ A web-based application for easy downloading of Coursera courses.
 
 # Description
 
-Download videos, assignments, notes, and all other resources of a course, organized week by week just as in the course. The application now features a modern React-based web interface for a better user experience.
+Download videos, assignments, notes, and all other resources of a course, organized week by week just as in the course. The app runs a small local web server and is controlled from your browser.
+
+The frontend is plain HTML, CSS and JavaScript served straight from the `web/` folder — there is no build step, no bundler and no Node.js requirement.
 
 ## Screenshots
 
@@ -16,24 +18,41 @@ Below are example screenshots of the current web interface. Usernames and any se
 
 ![Recent courses list](screenshots/recent-courses-blurred.png)
 
-# What's New (v3.4.0 - React Web App Transition)
+# What's New (v3.5.0)
 
-This version transitions from a desktop GUI application to a web-based app. Key changes and new features:
+This release fixes several correctness and security problems, and makes concurrent
+downloading actually configurable. See `changelog.md` for the full list.
 
-### New Features
-- **Web-Based Interface**: Modern React-inspired frontend accessible via browser at `http://localhost:7500`.
-- **Local Server**: Runs a secure local HTTP server with admin privilege handling for process management.
-- **Enhanced Cookie Extraction**: Improved CAUTH cookie detection from multiple browsers (Chrome, Firefox, Edge, Brave) using `rookiepy` and `browser_cookie3`.
-- **Non-Interactive Authentication**: Credentials must be provided upfront (no runtime prompts), improving automation.
-- **Security Audit**: Code reviewed for no malicious activity; credentials used only for Coursera API.
-- **Cross-Platform Compatibility**: Easier deployment on Windows, Linux, and Mac via web interface.
-- **Download Job Management**: Full control over downloads with start, pause, resume, cancel, and real-time logging.
-- **Activity Tree View**: Hierarchical display of course content with expand/collapse (partially implemented for full interactivity).
-- **Recent Courses**: Grid view of previously downloaded courses for quick access.
-- **Settings Panel**: Toggleable panel for basic configuration (partially implemented with limited options).
-- **Concurrent Downloads**: Parallel processing via multiprocessing for faster downloads.
-- **Retry Mechanism**: Automatic retry and resume for failed downloads.
-- **Responsive Design**: Basic web styling (partially implemented, desktop-focused).
+### Highlights
+- **Concurrent downloads work now.** `--jobs` was hardcoded to `1`, so downloads were
+  always sequential. Parallel downloads is now a setting in the Settings panel
+  (1-8, default 3) and is persisted between runs.
+- **Host header allowlist.** The API now rejects requests whose `Host` header is not a
+  loopback name, closing a DNS-rebinding hole that the previous Origin-versus-Host
+  comparison did not cover.
+- **Settings are stored as JSON, not pickle.** Loading a pickle executes any code
+  embedded in the file. Legacy `data.bin` files are migrated automatically through a
+  restricted unpickler that refuses to build objects.
+- **Correct HTTP status codes.** Expected conditions (no download to pause, oversized
+  or unparsable request body, no browser login found) now return 409/413/400 with an
+  actionable message instead of 500.
+- **Graceful shutdown.** Ctrl+C and `SIGTERM` stop the server cleanly, cancel a running
+  download, and no longer print a traceback. A port already in use reports how to fix it.
+- **Folder picker fallback.** The "Select" button no longer fails with
+  `No module named 'tkinter'`; it falls back to a native Windows dialog and, if no
+  picker is available at all, tells you to type the path instead.
+- **Input is validated before authentication is probed**, so a mistyped URL reports the
+  URL problem rather than sending you to debug your browser login.
+
+### Earlier in v3.4.0 (desktop GUI to web app)
+- **Web-Based Interface**: browser frontend served by a local Python HTTP server on `http://localhost:7500`.
+- **Local Server**: runs a local HTTP server with admin privilege handling for process management.
+- **Enhanced Cookie Extraction**: CAUTH cookie detection from multiple browsers (Chrome, Firefox, Edge, Brave) using `rookiepy`.
+- **Non-Interactive Authentication**: credentials must be provided upfront (no runtime prompts), improving automation.
+- **Download Job Management**: start, pause, resume, cancel, and real-time logging.
+- **Activity Tree View**: hierarchical display of course content with expand/collapse.
+- **Recent Courses**: grid view of previously downloaded courses for quick access.
+- **Retry Mechanism**: automatic retry and resume for failed downloads.
 
 ### Removed Features (GUI Cleanup)
 - **Desktop GUI**: Removed PyQt5-based GUI (`maingui.py`, `gui_components/`, icons).
@@ -44,14 +63,14 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 ### Comparison: Old vs. New
 | Feature | Old Version (GUI) | New Version (Web) |
 |---------|-------------------|-------------------|
-| Interface | Desktop GUI (PyQt5) | Web app (React-inspired) |
+| Interface | Desktop GUI (PyQt5) | Local web app (vanilla JS, no build step) |
 | Authentication | Interactive prompts + CAUTH | Upfront input + CAUTH |
-| Platform | Windows exe | Cross-platform web |
-| Dependencies | PyQt5, GUI libs | React, Node.js, Python |
-| Security | Basic | Audited (no exfiltration) |
+| Platform | Windows exe | Cross-platform (Windows-first) |
+| Dependencies | PyQt5, GUI libs | Python standard library + `requirements.txt` |
+| Security | Basic | Host allowlist, JSON settings storage, no credential persistence |
 | Download Org. | Week-by-week | Week-by-week (same) |
 | Resources | Videos, assignments, notes | Videos, assignments, notes (same) |
-| Concurrency | N/A | Multiprocessing support |
+| Concurrency | N/A | Configurable, 1-8 parallel downloads |
 | Retry/Resume | Basic | Advanced with persistence |
 | UI Responsiveness | Desktop-only | Partial (desktop-focused) |
 
@@ -62,7 +81,14 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 3. Create a virtual environment: `python -m venv .venv`
 4. Activate the virtual environment: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Linux/Mac)
 5. Install dependencies: `pip install -r requirements.txt`
-6. For the React frontend, ensure Node.js is installed, then run `npm install` in the `web/` directory.
+
+That is the whole setup. There is no frontend build step — the browser loads the files
+in `web/` directly.
+
+Optional: the folder picker uses Python's `tkinter`. It ships with the python.org
+installer on Windows and macOS, and is a separate system package on Linux
+(`sudo apt install python3-tk` on Debian/Ubuntu). If it is missing the app still runs;
+the "Select" button falls back to a native Windows dialog, or asks you to type the path.
 
 # Usage
 
@@ -73,11 +99,36 @@ This version transitions from a desktop GUI application to a web-based app. Key 
 
 **Note**: The app extracts CAUTH cookies from your browser for authentication. Ensure you are logged into Coursera in your browser (Chrome, Firefox, etc.) before use.
 
+## Command line options
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `--host` | `127.0.0.1` | Address to bind. Use `0.0.0.0` to accept LAN connections. |
+| `--port` | `7500` | Port to listen on. |
+| `--no-browser` | off | Do not open a browser window on startup. |
+| `--allowed-host` | loopback only | Extra `Host` header to accept. Repeatable. |
+| `--debug` | off | Verbose logging, including server-side tracebacks. |
+
+By default only `localhost`, `127.0.0.1` and `[::1]` are accepted in the `Host` header.
+If you serve the app through a reverse proxy or expose it on your LAN, name that host
+explicitly:
+
+```bash
+python web_app.py --host 0.0.0.0 --allowed-host 192.168.1.50
+```
+
+The same can be set without a flag via the `COURSERA_DOWNLOADER_ALLOWED_HOSTS`
+environment variable (comma separated). Do not add hostnames you do not control.
+
 # Security
 
-- Credentials are not stored; they are used only for authentication with Coursera's API.
+- Credentials are not stored; they are used only for authentication with Coursera's API. The CAUTH cookie is re-read from your browser on every run and is never written to `data.bin`.
+- The server binds to `127.0.0.1` by default and rejects any request whose `Host` header is not allowlisted, which prevents DNS-rebinding attacks from a malicious web page.
+- Request bodies are capped at 1 MiB.
+- Settings are stored as JSON in `data.bin` (mode `0600`). Pickle is no longer used, so a tampered settings file cannot execute code.
 - No data is sent to external servers except Coursera's official APIs.
 - Use at your own risk and comply with Coursera's terms of service.
+
 
 Shield: [![CC BY-NC 4.0][cc-by-nc-shield]][cc-by-nc]
 

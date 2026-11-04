@@ -1,9 +1,17 @@
 """
-A very simple key-value database using Python's pickle module.
-It supports basic operations like create, read, update, delete.
+A very simple key-value database stored as JSON.
+It supports basic operations for create, read, update, delete.
 It also supports nested key paths for updates.
+
+Older versions of this app persisted ``data.bin`` with :mod:`pickle`. Loading a
+pickle runs arbitrary code embedded in the file, so anyone able to write that
+path could execute code as the user running the downloader. The store is now
+plain JSON, and legacy pickle files are migrated through a restricted unpickler
+that refuses to instantiate any class.
 """
 
+import json
+import logging
 import os
 import pickle
 from copy import deepcopy
@@ -16,9 +24,26 @@ DEFAULT_DATA = {
         'classname': '',
         'path': '',
         'video_resolution': '720p',
-        'sl': 'en'
+        'sl': 'en',
+        'jobs': 3,
     }
 }
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    """Unpickler that decodes plain data but refuses to build objects.
+
+    Containers and scalars (dict, list, str, int, float, bool, None) are handled
+    by the pickle opcodes themselves and never reach ``find_class``, so a legacy
+    ``data.bin`` written by an older version of this app still migrates. Anything
+    carrying a class reference or a callable is rejected instead of executed.
+    """
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(
+            f"Refusing to load '{module}.{name}' from the settings file: "
+            "it must contain plain data only."
+        )
 
 
 def _merge_defaults(data, defaults):
@@ -33,9 +58,28 @@ def _merge_defaults(data, defaults):
     return data
 
 
+def _load_legacy_pickle(filename):
+    """Read a pre-JSON settings file, refusing anything but plain data.
+
+    Returns the decoded dict, or None when the file cannot be trusted or read.
+    """
+    try:
+        with open(filename, 'rb') as handle:
+            data = _RestrictedUnpickler(handle).load()
+    except (EOFError, OSError, pickle.PickleError, ValueError, AttributeError):
+        logging.warning(
+            "Could not migrate the legacy settings file at %s; starting fresh.",
+            filename,
+        )
+        return None
+    return data if isinstance(data, dict) else None
+
+
 class SimpleDB:
     def __init__(self, filename='data.bin'):
-        self.filename = path.abspath(path.join(path.dirname(__file__), filename)) # use this, so that, in bundled package the file is in the same directory as the script also
+        # Anchor to this module's directory so the settings file stays in one
+        # place regardless of the working directory the app was launched from.
+        self.filename = path.abspath(path.join(path.dirname(__file__), filename))
         self._data = self._load()
 
     def _load(self):
@@ -43,11 +87,15 @@ class SimpleDB:
         if not os.path.exists(self.filename):
             self._save(deepcopy(DEFAULT_DATA))
 
+        data = None
         try:
-            with open(self.filename, 'rb') as f:
-                data = pickle.load(f)
-        except (EOFError, OSError, pickle.PickleError):
-            data = {}
+            with open(self.filename, 'r', encoding='utf-8') as handle:
+                decoded = json.load(handle)
+            if isinstance(decoded, dict):
+                data = decoded
+        except (OSError, ValueError, UnicodeDecodeError):
+            # Not JSON: fall back to migrating a legacy pickle file.
+            data = _load_legacy_pickle(self.filename)
 
         if not isinstance(data, dict):
             data = {}
@@ -57,9 +105,22 @@ class SimpleDB:
         return data
 
     def _save(self, data):
-        """Save current data to file."""
-        with open(self.filename, 'wb') as f:
-            pickle.dump(data, f)
+        """Save current data to file.
+
+        Written to a temporary file and moved into place so a crash mid-write
+        cannot leave a truncated settings file behind.
+        """
+        tmp_filename = f"{self.filename}.tmp"
+        with open(tmp_filename, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_filename, self.filename)
+        try:
+            os.chmod(self.filename, 0o600)
+        except OSError:
+            # Best effort: not all platforms/filesystems support chmod.
+            pass
 
     def create(self, key, value):
         """Create a new key-value pair. Raises error if key exists."""
@@ -106,7 +167,6 @@ class SimpleDB:
         data_ref[key_path[-1]] = value
         self._save(self._data)
 
-
     def delete(self, key):
         """Delete a key-value pair."""
         if key in self._data:
@@ -119,16 +179,7 @@ class SimpleDB:
         """Return the full dictionary."""
         return dict(self._data)
 
+
 if __name__ == '__main__':
     db = SimpleDB()
-
-    # db.create('username', 'alice')
-    # print(db.read('username'))  # alice
-
-    # db.update('username', 'bob')
-    # print(db.read('username'))  # bob
-
-    # db.delete('username')
-    # print(db.read('username'))  # None
-
-    print(db.get_full_db())        # {}
+    print(db.get_full_db())

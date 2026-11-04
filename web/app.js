@@ -1,5 +1,6 @@
 const form = document.querySelector("#downloadForm");
 const languageSelect = document.querySelector("#subtitle_language");
+const jobsSelect = document.querySelector("#jobs");
 const courseInput = document.querySelector("#course");
 const pathInput = document.querySelector("#path");
 const versionLabel = document.querySelector("#version");
@@ -113,6 +114,21 @@ function fillSelect(select, items, selected) {
   });
 }
 
+function fillJobsSelect(select, range, selected) {
+  if (!select) return;
+  const min = Number(range && range.min) || 1;
+  const max = Number(range && range.max) || min;
+  const current = Number(selected) || min;
+  select.innerHTML = "";
+  for (let value = min; value <= max; value += 1) {
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = value === 1 ? "1 (sequential)" : String(value);
+    option.selected = value === current;
+    select.append(option);
+  }
+}
+
 function payloadFromForm() {
   const formData = new FormData(form);
   return {
@@ -120,6 +136,7 @@ function payloadFromForm() {
     path: formData.get("path"),
     video_resolution: formData.get("video_resolution"),
     subtitle_language: formData.get("subtitle_language"),
+    jobs: formData.get("jobs"),
   };
 }
 
@@ -1304,6 +1321,7 @@ async function init() {
     setAuthMessage("Login");
   }
   fillSelect(languageSelect, config.languages, config.defaults.subtitle_language);
+  fillJobsSelect(jobsSelect, config.jobs_range, config.defaults.jobs);
   const lastInput = localStorage.getItem(COURSE_INPUT_STORAGE_KEY) || config.defaults.course || "";
   if (lastInput) {
     addToCourseHistory(lastInput);
